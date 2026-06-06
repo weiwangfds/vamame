@@ -1,0 +1,15 @@
+[package]
+name = "oscilloscope"
+version = "0.1.0"
+edition = "2021"
+description = "Oscilloscope waveform viewer — Polars backend, zoom-aware downsample"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+egui_plot = "0.31"
+rfd = "0.15"
+polars = { version = "0.44", features = ["lazy", "csv", "round_series", "strings"] }
+
+[profile.release]
+opt-level = 2
