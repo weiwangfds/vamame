@@ -157,17 +157,7 @@ oscilloscope /path/to/data.csv
 
 ## 截图
 
-### 波形显示与测量
-
 ![波形显示](docs/images/waveform.png)
-
-### 眼图分析
-
-![眼图](docs/images/eye_diagram.png)
-
-### FFT 频谱
-
-![FFT](docs/images/fft.png)
 
 ## 技术架构
 
