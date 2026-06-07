@@ -29,6 +29,21 @@ pub struct WaveformData {
     pub time_span: f64,
 }
 
+// Public read-only accessors for sibling modules (measurement, export).
+impl WaveformData {
+    pub fn time_col(&self) -> &str {
+        &self.time_col
+    }
+
+    pub fn data_cols(&self) -> &[String] {
+        &self.data_cols
+    }
+
+    pub fn df(&self) -> &DataFrame {
+        &self.df
+    }
+}
+
 impl WaveformData {
     /// Load a CSV file. All columns are parsed as Float64.
     /// If the file has >1 column, column 0 is treated as the time axis.
@@ -115,6 +130,95 @@ impl WaveformData {
     /// Number of data channels.
     pub fn n_channels(&self) -> usize {
         self.data_cols.len()
+    }
+
+    /// Return raw (non-downsampled) `[x, y]` points for one channel within the
+    /// visible range, capped at `max_points`. Used by the measurement engine
+    /// for time-domain calculations (frequency, rise time, etc.).
+    ///
+    /// If the visible range contains more rows than `max_points`, rows are
+    /// evenly subsampled via per-column `gather_every`.
+    pub fn get_raw_points(
+        &self,
+        ch_idx: usize,
+        vis_x_min: f64,
+        vis_x_max: f64,
+        max_points: usize,
+    ) -> Vec<[f64; 2]> {
+        if ch_idx >= self.data_cols.len() || vis_x_min >= vis_x_max {
+            return Vec::new();
+        }
+
+        let data_col = &self.data_cols[ch_idx];
+        let time_col = &self.time_col;
+
+        let lf = self
+            .df
+            .clone()
+            .lazy()
+            .filter(
+                col(time_col)
+                    .gt_eq(lit(vis_x_min))
+                    .and(col(time_col).lt_eq(lit(vis_x_max))),
+            )
+            .select([col(time_col), col(data_col)]);
+
+        let df = match lf
+            .sort(
+                [time_col],
+                SortMultipleOptions::default().with_maintain_order(true),
+            )
+            .collect()
+        {
+            Ok(df) => df,
+            Err(e) => {
+                eprintln!("Raw points fetch error: {e}");
+                return Vec::new();
+            }
+        };
+
+        // Subsample if too many rows (per-column gather_every).
+        let df = if df.height() > max_points {
+            let step = (df.height() / max_points).max(1);
+            let cols: Vec<Column> = df
+                .get_columns()
+                .iter()
+                .map(|c| c.gather_every(step, 0))
+                .collect();
+            match DataFrame::new(cols) {
+                Ok(df) => df,
+                Err(e) => {
+                    eprintln!("gather_every error: {e}");
+                    return Vec::new();
+                }
+            }
+        } else {
+            df
+        };
+
+        let x_ca: &Float64Chunked = match df.column(time_col) {
+            Ok(c) => match c.f64() {
+                Ok(ca) => ca,
+                Err(_) => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        let y_ca: &Float64Chunked = match df.column(data_col) {
+            Ok(c) => match c.f64() {
+                Ok(ca) => ca,
+                Err(_) => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+
+        let n = df.height();
+        let mut points = Vec::with_capacity(n);
+        for i in 0..n {
+            if let (Some(x), Some(y)) = (x_ca.get(i), y_ca.get(i)) {
+                points.push([x, y]);
+            }
+        }
+        points
     }
 
     /// Return `[x+delay, y]` display points for one channel.

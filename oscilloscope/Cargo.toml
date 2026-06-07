@@ -1,6 +1,6 @@
 [package]
 name = "oscilloscope"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Oscilloscope waveform viewer — Polars backend, zoom-aware downsample"
 
@@ -10,6 +10,8 @@ egui = "0.31"
 egui_plot = "0.31"
 rfd = "0.15"
 polars = { version = "0.44", features = ["lazy", "csv", "round_series", "strings"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rustfft = "6"
 
 [profile.release]
 opt-level = 2
