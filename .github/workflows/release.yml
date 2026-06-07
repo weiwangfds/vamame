@@ -22,15 +22,47 @@ jobs:
         with:
           workspaces: oscilloscope
 
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libegl-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev
+
       - name: Check
         run: cargo check --manifest-path oscilloscope/Cargo.toml
 
       - name: Test
         run: cargo test --manifest-path oscilloscope/Cargo.toml
 
-  # ── Build Windows release binary ────────────────────────────────────
+  # ── Build: macOS ────────────────────────────────────────────────────
+  build-macos:
+    name: macOS
+    needs: check
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oscilloscope
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --manifest-path oscilloscope/Cargo.toml --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscilloscope-macos-${{ matrix.target }}
+          path: oscilloscope/target/${{ matrix.target }}/release/oscilloscope
+
+  # ── Build: Windows ──────────────────────────────────────────────────
   build-windows:
-    name: Windows x86_64
+    name: Windows
     needs: check
     runs-on: windows-latest
     steps:
@@ -51,25 +83,81 @@ jobs:
           name: oscilloscope-windows-x86_64
           path: oscilloscope/target/release/oscilloscope.exe
 
-  # ── Release: publish binary when a version tag is pushed ─────────────
+  # ── Build: Linux ────────────────────────────────────────────────────
+  build-linux:
+    name: Linux
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oscilloscope
+          key: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libegl-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Build release
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --manifest-path oscilloscope/Cargo.toml --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscilloscope-linux-${{ matrix.target }}
+          path: oscilloscope/target/${{ matrix.target }}/release/oscilloscope
+
+  # ── Release: publish binaries when a version tag is pushed ──────────
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, build-windows]
+    needs: [check, build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download Windows binary
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: oscilloscope-windows-x86_64
           path: ./release-assets
+          merge-multiple: true
 
-      - name: Rename binary
+      - name: Rename binaries
         run: |
-          mv ./release-assets/oscilloscope.exe \
-             ./release-assets/oscilloscope-${{ github.ref_name }}-windows-x86_64.exe
+          TAG="${{ github.ref_name }}"
+
+          # macOS
+          mv ./release-assets/oscilloscope-macos-x86_64-apple-darwin/oscilloscope \
+             ./release-assets/oscilloscope-${TAG}-macos-x86_64 || true
+          mv ./release-assets/oscilloscope-macos-aarch64-apple-darwin/oscilloscope \
+             ./release-assets/oscilloscope-${TAG}-macos-arm64 || true
+
+          # Windows
+          mv ./release-assets/oscilloscope-windows-x86_64/oscilloscope.exe \
+             ./release-assets/oscilloscope-${TAG}-windows-x86_64.exe || true
+
+          # Linux
+          mv ./release-assets/oscilloscope-linux-x86_64-unknown-linux-gnu/oscilloscope \
+             ./release-assets/oscilloscope-${TAG}-linux-x86_64 || true
+          mv ./release-assets/oscilloscope-linux-aarch64-unknown-linux-gnu/oscilloscope \
+             ./release-assets/oscilloscope-${TAG}-linux-arm64 || true
+
+          ls -lh ./release-assets/oscilloscope-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -78,4 +166,4 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: ./release-assets/*.exe
+          files: ./release-assets/oscilloscope-*
