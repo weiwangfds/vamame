@@ -58,6 +58,16 @@ pub(crate) struct ChannelState {
     pub visible: bool,
     pub delay: f64,
     pub color: Color32,
+    /// Whether the voltage threshold reference line is shown for this channel.
+    pub threshold_enabled: bool,
+    /// The voltage threshold value (in Volts).
+    pub threshold_value: f64,
+    /// Whether the binarized (square wave) view is shown for this channel.
+    pub binarize_enabled: bool,
+    /// When binarize is active, hide the original analog waveform.
+    pub binarize_hide_original: bool,
+    /// String buffer for the threshold text input.
+    pub threshold_text: String,
 }
 
 #[derive(Clone)]
@@ -335,6 +345,11 @@ impl OscilloscopeApp {
                             visible: true,
                             delay: 0.0,
                             color: CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
+                            threshold_enabled: false,
+                            threshold_value: 0.0,
+                            binarize_enabled: false,
+                            binarize_hide_original: false,
+                            threshold_text: "0.0".to_owned(),
                         })
                         .collect();
 

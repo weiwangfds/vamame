@@ -124,6 +124,11 @@ impl OscilloscopeApp {
                             visible: true,
                             delay: 0.0,
                             color,
+                            threshold_enabled: false,
+                            threshold_value: 0.0,
+                            binarize_enabled: false,
+                            binarize_hide_original: false,
+                            threshold_text: "0.0".to_owned(),
                         });
                         self.math_channels.push(def);
                         self.cache.push(None);

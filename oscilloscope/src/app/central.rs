@@ -104,6 +104,22 @@ impl OscilloscopeApp {
                                     },
                                 );
 
+                                // -- color picker (small swatch, click to change) --
+                                {
+                                    let c = self.channels[ch_idx].color;
+                                    let mut rgb = [
+                                        c.r() as f32 / 255.0,
+                                        c.g() as f32 / 255.0,
+                                        c.b() as f32 / 255.0,
+                                    ];
+                                    egui::color_picker::color_edit_button_rgb(ui, &mut rgb);
+                                    self.channels[ch_idx].color = Color32::from_rgb(
+                                        (rgb[0] * 255.0) as u8,
+                                        (rgb[1] * 255.0) as u8,
+                                        (rgb[2] * 255.0) as u8,
+                                    );
+                                }
+
                                 // -- channel name (double-click to rename) --
                                 if self.editing_channel == Some(ch_idx) {
                                     let name = &mut self.channels[ch_idx].name;
@@ -187,6 +203,88 @@ impl OscilloscopeApp {
                             }
                         });
 
+                        // ======== threshold / binarize controls (second row) ========
+                        ui.horizontal_wrapped(|ui| {
+                            for &ch_idx in &strip_chs {
+                                if ch_idx >= self.channels.len() {
+                                    continue;
+                                }
+                                let ch_color = self.channels[ch_idx].color;
+
+                                // -- threshold value input (always visible) --
+                                ui.label(
+                                    RichText::new(format!("{} Vth:", self.channels[ch_idx].name))
+                                        .small()
+                                        .color(ch_color),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.channels[ch_idx].threshold_value)
+                                        .speed(0.01)
+                                        .fixed_decimals(3)
+                                        .suffix(" V"),
+                                );
+
+                                // -- threshold line visibility toggle --
+                                let thresh_text = if self.channels[ch_idx].threshold_enabled {
+                                    "Line ON"
+                                } else {
+                                    "Line"
+                                };
+                                let thresh_color = if self.channels[ch_idx].threshold_enabled {
+                                    Color32::from_rgb(255, 100, 100)
+                                } else {
+                                    Color32::GRAY
+                                };
+                                if ui
+                                    .button(RichText::new(thresh_text).small().color(thresh_color))
+                                    .on_hover_text("Show/hide red threshold reference line")
+                                    .clicked()
+                                {
+                                    self.channels[ch_idx].threshold_enabled =
+                                        !self.channels[ch_idx].threshold_enabled;
+                                }
+
+                                // -- binarize toggle --
+                                let bin_text = if self.channels[ch_idx].binarize_enabled {
+                                    "0/1 ON"
+                                } else {
+                                    "0/1"
+                                };
+                                let bin_color = if self.channels[ch_idx].binarize_enabled {
+                                    ch_color
+                                } else {
+                                    Color32::GRAY
+                                };
+                                if ui
+                                    .button(RichText::new(bin_text).small().color(bin_color))
+                                    .on_hover_text("Show binarized square wave")
+                                    .clicked()
+                                {
+                                    self.channels[ch_idx].binarize_enabled =
+                                        !self.channels[ch_idx].binarize_enabled;
+                                }
+
+                                // -- hide original waveform toggle (only when binarize on) --
+                                if self.channels[ch_idx].binarize_enabled {
+                                    let hide_text = if self.channels[ch_idx].binarize_hide_original {
+                                        "Hide ON"
+                                    } else {
+                                        "Hide"
+                                    };
+                                    if ui
+                                        .button(RichText::new(hide_text).small())
+                                        .on_hover_text("Hide original analog waveform")
+                                        .clicked()
+                                    {
+                                        self.channels[ch_idx].binarize_hide_original =
+                                            !self.channels[ch_idx].binarize_hide_original;
+                                    }
+                                }
+
+                                ui.separator();
+                            }
+                        });
+
                         // ======== ensure cache ========
                         let strip_chs = self.strips[s_idx].channel_indices.clone();
                         for &ch_idx in &strip_chs {
@@ -256,12 +354,61 @@ impl OscilloscopeApp {
                                     }
                                     if let Some(ref cached) = self.cache[ch_idx] {
                                         let ch = &self.channels[ch_idx];
-                                        let line =
-                                            Line::new(PlotPoints::from(cached.points.clone()))
-                                                .color(ch.color)
+
+                                        // Draw original analog waveform (unless hidden by binarize)
+                                        let hide_original = ch.binarize_enabled && ch.binarize_hide_original;
+                                        if !hide_original {
+                                            let line =
+                                                Line::new(PlotPoints::from(cached.points.clone()))
+                                                    .color(ch.color)
+                                                    .width(1.5)
+                                                    .name(&ch.name);
+                                            plot_ui.line(line);
+                                        }
+
+                                        // --- Threshold reference line (red dashed) ---
+                                        if ch.threshold_enabled || ch.binarize_enabled {
+                                            let bounds = plot_ui.plot_bounds();
+                                            // Use visible X range only — no ±1e6 expansion,
+                                            // which causes auto-bounds oscillation.
+                                            let x_min = bounds.min()[0];
+                                            let x_max = bounds.max()[0];
+                                            let thresh = ch.threshold_value;
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from(vec![
+                                                    [x_min, thresh],
+                                                    [x_max, thresh],
+                                                ]))
+                                                .color(
+                                                    Color32::from_rgba_unmultiplied(255, 80, 80, 200),
+                                                )
                                                 .width(1.5)
-                                                .name(&ch.name);
-                                        plot_ui.line(line);
+                                                .style(egui_plot::LineStyle::Dashed { length: 6.0 })
+                                                .name(&format!("{} Vth={:.3}V", ch.name, thresh)),
+                                            );
+                                        }
+
+                                        // --- Binarized square wave ---
+                                        if ch.binarize_enabled {
+                                            let thresh = ch.threshold_value;
+                                            let bin_points =
+                                                generate_binarized_points(&cached.points, thresh);
+                                            if !bin_points.is_empty() {
+                                                plot_ui.line(
+                                                    Line::new(PlotPoints::from(bin_points))
+                                                        .color(
+                                                            Color32::from_rgba_unmultiplied(
+                                                                ch_color_r(ch.color),
+                                                                ch_color_g(ch.color),
+                                                                ch_color_b(ch.color),
+                                                                180,
+                                                            ),
+                                                        )
+                                                        .width(2.0)
+                                                        .name(&format!("{} 0/1", ch.name)),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
 
@@ -425,4 +572,81 @@ impl OscilloscopeApp {
 
         let _ = (ui, s_idx);
     }
+}
+
+// ---------- helper functions ----------
+
+/// Extract the R component from a Color32.
+fn ch_color_r(c: Color32) -> u8 {
+    c.r()
+}
+
+/// Extract the G component from a Color32.
+fn ch_color_g(c: Color32) -> u8 {
+    c.g()
+}
+
+/// Extract the B component from a Color32.
+fn ch_color_b(c: Color32) -> u8 {
+    c.b()
+}
+
+/// Generate a binarized square-wave point sequence from sampled data.
+///
+/// Uses the threshold to decide HIGH vs LOW:
+/// - value > threshold → HIGH
+/// - value ≤ threshold → LOW
+///
+/// The square-wave amplitude is a small offset centered on the threshold
+/// so it does not distort the Y-axis.  Vertical edges are inserted at
+/// exact crossing times via linear interpolation for clean transitions.
+fn generate_binarized_points(points: &[[f64; 2]], threshold: f64) -> Vec<[f64; 2]> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+
+    // Compute half-amplitude from the signal's own range, but keep it
+    // modest (15% of p-p) so the square wave is visible yet doesn't
+    // obscure the original waveform.
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    for p in points {
+        if p[1] < v_min { v_min = p[1]; }
+        if p[1] > v_max { v_max = p[1]; }
+    }
+    let half_amp = ((v_max - v_min) * 0.15).max(0.05);
+    let v_high = threshold + half_amp;
+    let v_low = threshold - half_amp;
+
+    let mut result = Vec::with_capacity(points.len() * 2);
+
+    let binarize = |v: f64| -> f64 {
+        if v > threshold { v_high } else { v_low }
+    };
+
+    let (t0, v0) = (points[0][0], points[0][1]);
+    result.push([t0, binarize(v0)]);
+
+    for i in 1..points.len() {
+        let (t_prev, v_prev) = (points[i - 1][0], points[i - 1][1]);
+        let (t_curr, v_curr) = (points[i][0], points[i][1]);
+
+        let above_prev = v_prev > threshold;
+        let above_curr = v_curr > threshold;
+
+        // Insert a vertical edge at the exact crossing time.
+        if above_prev != above_curr {
+            let dv = v_curr - v_prev;
+            if dv.abs() > f64::EPSILON {
+                let fraction = (threshold - v_prev) / dv;
+                let t_cross = t_prev + fraction * (t_curr - t_prev);
+                result.push([t_cross, binarize(v_prev)]);
+                result.push([t_cross, binarize(v_curr)]);
+            }
+        }
+
+        result.push([t_curr, binarize(v_curr)]);
+    }
+
+    result
 }
