@@ -1,3 +1,8 @@
 /target
 .DS_Store
 oscilloscope/target
+
+# Large data files
+.oscv/
+*.csv
+screenshot.png

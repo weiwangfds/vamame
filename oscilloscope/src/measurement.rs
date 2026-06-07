@@ -53,17 +53,26 @@ impl Measurements {
     pub fn compute(data: &WaveformData, ch_idx: usize, vis_x_min: f64, vis_x_max: f64) -> Self {
         let mut m = Self::default();
 
-        // --- Statistical measurements via Polars ---
-        if let Ok(stats) = compute_stats(data, ch_idx, vis_x_min, vis_x_max) {
-            m.vmax = stats.vmax;
-            m.vmin = stats.vmin;
-            m.vpp = stats.vpp;
-            m.vmean = stats.vmean;
-            m.vrms = stats.vrms;
+        // --- Raw points (works for both Parquet and InMemory paths) ---
+        let points = data.get_raw_points(ch_idx, vis_x_min, vis_x_max, MEASUREMENT_MAX_POINTS);
+        if points.len() < 2 {
+            return m;
         }
 
+        // --- Statistical measurements from raw points ---
+        let y_vals: Vec<f64> = points.iter().map(|p| p[1]).collect();
+        let vmax = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let vmin = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let sum: f64 = y_vals.iter().sum();
+        let sum_sq: f64 = y_vals.iter().map(|v| v * v).sum();
+        let n = y_vals.len() as f64;
+        m.vmax = vmax;
+        m.vmin = vmin;
+        m.vpp = vmax - vmin;
+        m.vmean = sum / n;
+        m.vrms = (sum_sq / n).sqrt();
+
         // --- Time-domain measurements from raw points ---
-        let points = data.get_raw_points(ch_idx, vis_x_min, vis_x_max, MEASUREMENT_MAX_POINTS);
         if points.len() >= 4 {
             let td = compute_time_domain(&points);
             m.frequency = td.frequency;
@@ -106,71 +115,6 @@ impl Measurements {
         }
         format!("{:.4e} {}", value, unit)
     }
-}
-
-// ---------- statistical (Polars) ----------
-
-struct Stats {
-    vmax: f64,
-    vmin: f64,
-    vpp: f64,
-    vmean: f64,
-    vrms: f64,
-}
-
-fn compute_stats(
-    data: &WaveformData,
-    ch_idx: usize,
-    vis_x_min: f64,
-    vis_x_max: f64,
-) -> Result<Stats, String> {
-    use polars::prelude::*;
-
-    let data_col = data
-        .data_cols()
-        .get(ch_idx)
-        .ok_or_else(|| "Channel index out of range".to_owned())?
-        .clone();
-    let time_col = data.time_col().to_owned();
-
-    let result = data
-        .df()
-        .clone()
-        .lazy()
-        .filter(
-            col(&time_col)
-                .gt_eq(lit(vis_x_min))
-                .and(col(&time_col).lt_eq(lit(vis_x_max))),
-        )
-        .select([
-            col(&data_col).max().alias("vmax"),
-            col(&data_col).min().alias("vmin"),
-            col(&data_col).mean().alias("vmean"),
-            ((col(&data_col) * col(&data_col)).mean()).alias("mean_sq"),
-        ])
-        .collect()
-        .map_err(|e| format!("Stats error: {e}"))?;
-
-    let vmax = extract_f64(&result, "vmax");
-    let vmin = extract_f64(&result, "vmin");
-    let vmean = extract_f64(&result, "vmean");
-    let mean_sq = extract_f64(&result, "mean_sq");
-
-    Ok(Stats {
-        vmax,
-        vmin,
-        vpp: vmax - vmin,
-        vmean,
-        vrms: mean_sq.sqrt(),
-    })
-}
-
-fn extract_f64(df: &polars::prelude::DataFrame, name: &str) -> f64 {
-    df.column(name)
-        .ok()
-        .and_then(|c| c.f64().ok())
-        .and_then(|ca| ca.get(0))
-        .unwrap_or(f64::NAN)
 }
 
 // ---------- time-domain (raw points) ----------

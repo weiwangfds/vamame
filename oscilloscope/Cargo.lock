@@ -3099,9 +3099,13 @@ dependencies = [
  "egui",
  "egui_plot",
  "image",
+ "md-5",
  "polars",
+ "pollster",
  "rfd",
  "rustfft",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3626,6 +3630,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "enum_dispatch",
+ "futures",
  "hashbrown 0.15.5",
  "num-traits",
  "polars-arrow",

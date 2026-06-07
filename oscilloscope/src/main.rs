@@ -1,9 +1,6 @@
 //! Oscilloscope waveform viewer.
 //!
-//! Import CSV data, view per-channel strips, drag to merge, zoom/pan to inspect.
-//! Data layer uses Polars for fast loading and zoom-aware downsampling.
-//!
-//! Run: `cargo run` from the `oscilloscope/` directory.
+//! Run: `cargo run -- /path/to/file.csv`
 
 mod app;
 mod cursor;
@@ -22,9 +19,20 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // Check for CSV path as command-line argument
+    let csv_path = std::env::args().nth(1);
+
     eframe::run_native(
         "Oscilloscope",
         options,
-        Box::new(|_cc| Ok(Box::new(app::OscilloscopeApp::default()))),
+        Box::new(move |cc| {
+            let mut app = app::OscilloscopeApp::default();
+            if let Some(ref path) = csv_path {
+                // Schedule load on first frame via status message
+                app.pending_load_path = Some(path.clone());
+            }
+            let _ = cc;
+            Ok(Box::new(app))
+        }),
     )
 }

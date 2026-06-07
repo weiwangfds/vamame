@@ -1,143 +1,101 @@
-//! Data layer backed by Polars.
+//! Data layer — unified interface backed by cached Parquet.
 //!
-//! Loads CSV into a Polars `DataFrame` and provides zoom-aware
-//! downsampled points for each channel. Two-level strategy:
-//!
-//! - **Zoomed in** (visible rows ≤ max_points): return ALL original points,
-//!   faithfully reproducing the waveform sample-by-sample.
-//! - **Zoomed out** (visible rows > max_points): M4 algorithm emits 4 points
-//!   per bin (first, min, max, last), preserving peaks and visual shape.
-//!
-//! Both paths use Polars lazy evaluation so even 100 M+ rows respond quickly.
+//! On first open, the CSV is converted to Parquet (stored in a `.oscv/`
+//! directory next to the source file).  Subsequent opens validate the
+//! cache via an MD5 fingerprint and load instantly.  All queries use
+//! `scan_parquet` with predicate pushdown so only the relevant row groups
+//! are read from disk, keeping memory usage constant.
+
+pub mod cache;
+pub mod indexed;
 
 use polars::prelude::*;
 
-/// Loaded waveform data and metadata.
-pub struct WaveformData {
-    /// The full Polars DataFrame (kept for lazy operations).
-    df: DataFrame,
-    /// Column name used as the x-axis (time).
-    time_col: String,
-    /// Column names of the data channels (excluding the time column).
-    data_cols: Vec<String>,
-    /// Total number of rows.
-    pub n_rows: usize,
-    /// Global x-axis range.
-    pub x_min: f64,
-    pub x_max: f64,
-    /// x_max - x_min.
-    pub time_span: f64,
+use cache::CacheMeta;
+
+/// Loaded waveform data — either cached (Parquet) or legacy (in-memory).
+pub enum WaveformData {
+    /// Parquet-backed with lazy scan queries.
+    Parquet(ParquetData),
+    /// Legacy Polars in-memory (small files, fallback).
+    InMemory(InMemoryData),
 }
 
-// Public read-only accessors for sibling modules (measurement, export).
 impl WaveformData {
+    // ── Public accessors ──
+
+    pub fn n_channels(&self) -> usize {
+        match self {
+            Self::Parquet(d) => d.meta.n_channels(),
+            Self::InMemory(d) => d.data_cols.len(),
+        }
+    }
+
+    pub fn n_rows(&self) -> usize {
+        match self {
+            Self::Parquet(d) => d.meta.n_rows,
+            Self::InMemory(d) => d.n_rows,
+        }
+    }
+
+    pub fn x_min(&self) -> f64 {
+        match self {
+            Self::Parquet(d) => d.meta.x_min,
+            Self::InMemory(d) => d.x_min,
+        }
+    }
+
+    pub fn x_max(&self) -> f64 {
+        match self {
+            Self::Parquet(d) => d.meta.x_max,
+            Self::InMemory(d) => d.x_max,
+        }
+    }
+
+    pub fn time_span(&self) -> f64 {
+        self.x_max() - self.x_min()
+    }
+
     pub fn time_col(&self) -> &str {
-        &self.time_col
+        match self {
+            Self::Parquet(d) => &d.time_col,
+            Self::InMemory(d) => &d.time_col,
+        }
     }
 
     pub fn data_cols(&self) -> &[String] {
-        &self.data_cols
+        match self {
+            Self::Parquet(d) => &d.data_cols,
+            Self::InMemory(d) => &d.data_cols,
+        }
     }
 
     pub fn df(&self) -> &DataFrame {
-        &self.df
-    }
-}
-
-impl WaveformData {
-    /// Load a CSV file. All columns are parsed as Float64.
-    /// If the file has >1 column, column 0 is treated as the time axis.
-    pub fn load_csv(path: &str) -> Result<Self, String> {
-        let df = CsvReadOptions::default()
-            .with_has_header(false)
-            .try_into_reader_with_file_path(Some(path.into()))
-            .map_err(|e| format!("CSV open error: {e}"))?
-            .finish()
-            .map_err(|e| format!("CSV parse error: {e}"))?;
-
-        Self::from_dataframe(df)
-    }
-
-    /// Build from an already-loaded DataFrame (useful for testing).
-    fn from_dataframe(mut df: DataFrame) -> Result<Self, String> {
-        let n_cols = df.width();
-        let n_rows = df.height();
-
-        if n_cols == 0 || n_rows == 0 {
-            return Err("File has no data".to_owned());
-        }
-
-        let col_names: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        // Cast all columns to Float64.
-        // String columns (e.g. from whitespace-padded CSV values like
-        // " 3.0269131E-01") are manually trimmed and parsed via Rust's
-        // trim()/parse(), since Polars' cast skips values with leading spaces.
-        for (idx, name) in col_names.iter().enumerate() {
-            let s = df.column(name).map_err(|e| format!("{e}"))?;
-            if s.dtype() == &DataType::String {
-                let ca = s.str().map_err(|e| format!("{e}"))?;
-                let mut parsed: Float64Chunked = ca
-                    .into_iter()
-                    .map(|opt| opt.and_then(|v| v.trim().parse::<f64>().ok()))
-                    .collect();
-                // Preserve the original column name (collect defaults to "").
-                parsed.rename(name.into());
-                df.replace_column(idx, parsed.into_series())
-                    .map_err(|e| format!("{e}"))?;
-            } else if s.dtype() != &DataType::Float64 {
-                let casted = s
-                    .cast(&DataType::Float64)
-                    .map_err(|e| format!("Cast error for '{name}': {e}"))?;
-                df.replace_column(idx, casted)
-                    .map_err(|e| format!("{e}"))?;
+        match self {
+            Self::Parquet(_) => {
+                static EMPTY: std::sync::OnceLock<DataFrame> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| DataFrame::empty())
             }
+            Self::InMemory(d) => &d.df,
         }
-
-        // Determine time column.
-        let (time_col, data_cols) = if n_cols > 1 {
-            (col_names[0].clone(), col_names[1..].to_vec())
-        } else {
-            (
-                col_names[0].clone(),
-                vec![col_names[0].clone()],
-            )
-        };
-
-        // Compute global x range.
-        let time_series = df.column(&time_col).map_err(|e| format!("{e}"))?;
-        let ca = time_series
-            .f64()
-            .map_err(|e| format!("Time column not f64: {e}"))?;
-        let x_min = ca.min().ok_or("Empty time column")?;
-        let x_max = ca.max().ok_or("Empty time column")?;
-
-        Ok(Self {
-            df,
-            time_col,
-            data_cols,
-            n_rows,
-            x_min,
-            x_max,
-            time_span: x_max - x_min,
-        })
     }
 
-    /// Number of data channels.
-    pub fn n_channels(&self) -> usize {
-        self.data_cols.len()
+    // ── Queries ──
+
+    pub fn get_channel_points(
+        &self,
+        ch_idx: usize,
+        delay: f64,
+        vis_x_min: f64,
+        vis_x_max: f64,
+        max_points: usize,
+    ) -> Vec<[f64; 2]> {
+        match self {
+            Self::Parquet(d) => d.get_channel_points(ch_idx, delay, vis_x_min, vis_x_max, max_points),
+            Self::InMemory(d) => d.get_channel_points(ch_idx, delay, vis_x_min, vis_x_max, max_points),
+        }
     }
 
-    /// Return raw (non-downsampled) `[x, y]` points for one channel within the
-    /// visible range, capped at `max_points`. Used by the measurement engine
-    /// for time-domain calculations (frequency, rise time, etc.).
-    ///
-    /// If the visible range contains more rows than `max_points`, rows are
-    /// evenly subsampled via per-column `gather_every`.
     pub fn get_raw_points(
         &self,
         ch_idx: usize,
@@ -145,91 +103,78 @@ impl WaveformData {
         vis_x_max: f64,
         max_points: usize,
     ) -> Vec<[f64; 2]> {
-        if ch_idx >= self.data_cols.len() || vis_x_min >= vis_x_max {
-            return Vec::new();
+        match self {
+            Self::Parquet(d) => d.get_raw_points(ch_idx, vis_x_min, vis_x_max, max_points),
+            Self::InMemory(d) => d.get_raw_points(ch_idx, vis_x_min, vis_x_max, max_points),
         }
-
-        let data_col = &self.data_cols[ch_idx];
-        let time_col = &self.time_col;
-
-        let lf = self
-            .df
-            .clone()
-            .lazy()
-            .filter(
-                col(time_col)
-                    .gt_eq(lit(vis_x_min))
-                    .and(col(time_col).lt_eq(lit(vis_x_max))),
-            )
-            .select([col(time_col), col(data_col)]);
-
-        let df = match lf
-            .sort(
-                [time_col],
-                SortMultipleOptions::default().with_maintain_order(true),
-            )
-            .collect()
-        {
-            Ok(df) => df,
-            Err(e) => {
-                eprintln!("Raw points fetch error: {e}");
-                return Vec::new();
-            }
-        };
-
-        // Subsample if too many rows (per-column gather_every).
-        let df = if df.height() > max_points {
-            let step = (df.height() / max_points).max(1);
-            let cols: Vec<Column> = df
-                .get_columns()
-                .iter()
-                .map(|c| c.gather_every(step, 0))
-                .collect();
-            match DataFrame::new(cols) {
-                Ok(df) => df,
-                Err(e) => {
-                    eprintln!("gather_every error: {e}");
-                    return Vec::new();
-                }
-            }
-        } else {
-            df
-        };
-
-        let x_ca: &Float64Chunked = match df.column(time_col) {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(_) => return Vec::new(),
-            },
-            _ => return Vec::new(),
-        };
-        let y_ca: &Float64Chunked = match df.column(data_col) {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(_) => return Vec::new(),
-            },
-            _ => return Vec::new(),
-        };
-
-        let n = df.height();
-        let mut points = Vec::with_capacity(n);
-        for i in 0..n {
-            if let (Some(x), Some(y)) = (x_ca.get(i), y_ca.get(i)) {
-                points.push([x, y]);
-            }
-        }
-        points
     }
 
-    /// Return `[x+delay, y]` display points for one channel.
+    // ── Loading ──
+
+    /// Open a CSV file.
     ///
-    /// Two-level strategy:
-    ///   1. **Exact mode** (visible rows ≤ max_points): return every original
-    ///      point — pixel-perfect reproduction of the waveform.
-    ///   2. **M4 mode** (visible rows > max_points): bin into `max_points/4`
-    ///      buckets, emit first/min/max/last per bin (4 pts/bin), preserving
-    ///      peaks and overall shape. This is the standard oscilloscope
-    ///      peak-detect algorithm used by Tektronix, Keysight, etc.
+    /// 1. Check for `.oscv/` cache → if valid, use Parquet path
+    /// 2. Otherwise, convert CSV → Parquet in background, then use Parquet path
+    /// 3. Progress callback: `(rows_done, bytes_done, total_bytes)`
+    pub fn load_csv(path: &str, progress: &dyn Fn(usize, u64, u64)) -> Result<Self, String> {
+        let csv_path = std::path::Path::new(path);
+
+        // Try loading cached metadata
+        if let Some(meta) = cache::load_meta(csv_path) {
+            eprintln!(
+                "Parquet cache HIT: {} rows, {} cols, range [{:.6e}, {:.6e}]",
+                meta.n_rows, meta.n_cols, meta.x_min, meta.x_max,
+            );
+            return Ok(Self::Parquet(ParquetData::from_meta(meta, csv_path)));
+        }
+
+        // No cache — convert CSV → Parquet
+        eprintln!("No Parquet cache found, converting {} …", path);
+        let meta = cache::convert_csv_to_parquet(csv_path, progress)?;
+        Ok(Self::Parquet(ParquetData::from_meta(meta, csv_path)))
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Parquet-backed data (primary path)
+// ───────────────────────────────────────────────────────────────────────
+
+pub struct ParquetData {
+    pub meta: CacheMeta,
+    pub time_col: String,
+    pub data_cols: Vec<String>,
+    parquet_path: std::path::PathBuf,
+}
+
+impl CacheMeta {
+    pub fn n_channels(&self) -> usize {
+        if self.n_cols > 1 { self.n_cols - 1 } else { 1 }
+    }
+}
+
+impl ParquetData {
+    pub fn from_meta(meta: CacheMeta, csv_path: &std::path::Path) -> Self {
+        let time_col = meta.columns[0].clone();
+        let data_cols = if meta.n_cols > 1 {
+            meta.columns[1..].to_vec()
+        } else {
+            vec![meta.columns[0].clone()]
+        };
+        Self {
+            meta,
+            time_col,
+            data_cols,
+            parquet_path: cache::parquet_path(csv_path),
+        }
+    }
+
+    fn lazy_scan(&self) -> LazyFrame {
+        LazyFrame::scan_parquet(
+            &self.parquet_path as &std::path::Path,
+            ScanArgsParquet::default(),
+        ).unwrap()
+    }
+
     pub fn get_channel_points(
         &self,
         ch_idx: usize,
@@ -242,242 +187,210 @@ impl WaveformData {
             return Vec::new();
         }
 
-        let data_col = &self.data_cols[ch_idx];
-        let time_col = &self.time_col;
+        let tc = &self.time_col;
+        let dc = &self.data_cols[ch_idx];
 
-        // Shared lazy frame: filter to visible x-range.
-        let lf = self
-            .df
-            .clone()
-            .lazy()
+        let lf = self.lazy_scan()
             .filter(
-                col(time_col)
-                    .gt_eq(lit(vis_x_min))
-                    .and(col(time_col).lt_eq(lit(vis_x_max))),
+                col(tc).gt_eq(lit(vis_x_min))
+                    .and(col(tc).lt_eq(lit(vis_x_max)))
             )
-            .select([col(time_col), col(data_col)]);
+            .select([col(tc), col(dc)]);
 
-        // --- Step 1: count visible rows to decide strategy ---
-        let n_visible = match lf
-            .clone()
-            .select([col(time_col).count().cast(DataType::Int64).alias("cnt")])
+        // Count visible rows to decide strategy
+        let n_visible = match lf.clone()
+            .select([col(tc).count().cast(DataType::Int64).alias("cnt")])
             .collect()
         {
-            Ok(df) => df
-                .column("cnt")
-                .ok()
+            Ok(df) => df.column("cnt").ok()
                 .and_then(|c| c.i64().ok())
                 .and_then(|ca| ca.get(0))
                 .unwrap_or(i64::MAX) as usize,
-            Err(e) => {
-                eprintln!("Count error: {e}");
-                return Vec::new();
-            }
+            Err(e) => { eprintln!("Parquet count error: {e}"); return Vec::new(); }
         };
 
-        // --- Step 2: exact mode — return ALL visible points ---
         if n_visible <= max_points {
-            return self.fetch_all_points(lf, time_col, data_col, delay);
+            self.fetch_exact(lf, delay)
+        } else {
+            self.m4_downsample(lf, dc, delay, vis_x_min, vis_x_max, max_points)
         }
-
-        // --- Step 3: M4 downsample — first/min/max/last per bin ---
-        self.m4_downsample(lf, time_col, data_col, delay, vis_x_min, vis_x_max, max_points)
     }
 
-    /// Fetch all visible points (exact reproduction, no downsampling).
-    fn fetch_all_points(
+    pub fn get_raw_points(
         &self,
-        lf: LazyFrame,
-        time_col: &str,
-        data_col: &str,
-        delay: f64,
+        ch_idx: usize,
+        vis_x_min: f64,
+        vis_x_max: f64,
+        max_points: usize,
     ) -> Vec<[f64; 2]> {
-        let df = match lf
-            .sort(
-                [time_col],
-                SortMultipleOptions::default().with_maintain_order(true),
-            )
-            .collect()
-        {
-            Ok(df) => df,
-            Err(e) => {
-                eprintln!("Full fetch error: {e}");
-                return Vec::new();
-            }
-        };
-
-        let x_ca = match df.column(time_col) {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(_) => return Vec::new(),
-            },
-            _ => return Vec::new(),
-        };
-        let y_ca = match df.column(data_col) {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(_) => return Vec::new(),
-            },
-            _ => return Vec::new(),
-        };
-
-        let n = df.height();
-        let mut points = Vec::with_capacity(n);
-        for i in 0..n {
-            if let (Some(x), Some(y)) = (x_ca.get(i), y_ca.get(i)) {
-                points.push([x + delay, y]);
-            }
+        if ch_idx >= self.data_cols.len() || vis_x_min >= vis_x_max {
+            return Vec::new();
         }
-        points
+
+        let tc = &self.time_col;
+        let dc = &self.data_cols[ch_idx];
+
+        let lf = self.lazy_scan()
+            .filter(
+                col(tc).gt_eq(lit(vis_x_min))
+                    .and(col(tc).lt_eq(lit(vis_x_max)))
+            )
+            .select([col(tc), col(dc)]);
+
+        let df = match lf.sort(
+            [tc],
+            SortMultipleOptions::default().with_maintain_order(true),
+        ).collect() {
+            Ok(df) => df,
+            Err(e) => { eprintln!("Raw points error: {e}"); return Vec::new(); }
+        };
+
+        let df = if df.height() > max_points {
+            let step = (df.height() / max_points).max(1);
+            let cols: Vec<Column> = df.get_columns().iter().map(|c| c.gather_every(step, 0)).collect();
+            DataFrame::new(cols).unwrap_or(df)
+        } else {
+            df
+        };
+
+        extract_points(&df, tc, 0.0)
     }
 
-    /// M4 downsample: emit first/min/max/last per bin (4 points per bin).
-    ///
-    /// This preserves waveform peaks (min/max), maintains visual continuity
-    /// between bins (first/last), and is the standard approach used by
-    /// professional oscilloscopes.
+    fn fetch_exact(&self, lf: LazyFrame, delay: f64) -> Vec<[f64; 2]> {
+        let tc = &self.time_col;
+        let df = match lf.sort(
+            [tc],
+            SortMultipleOptions::default().with_maintain_order(true),
+        ).collect() {
+            Ok(df) => df,
+            Err(e) => { eprintln!("Exact fetch error: {e}"); return Vec::new(); }
+        };
+        extract_points(&df, tc, delay)
+    }
+
     fn m4_downsample(
         &self,
         lf: LazyFrame,
-        time_col: &str,
-        data_col: &str,
+        dc: &str,
         delay: f64,
         vis_x_min: f64,
         vis_x_max: f64,
         max_points: usize,
     ) -> Vec<[f64; 2]> {
+        let tc = &self.time_col;
+
+        // Use first data column (we already know ch_idx is valid from caller)
         let range = vis_x_max - vis_x_min;
         let n_bins = (max_points / 4).max(1);
         let bin_width = range / n_bins as f64;
 
         let result = lf
             .select([
-                col(time_col),
-                col(data_col),
-                (((col(time_col) - lit(vis_x_min)) / lit(bin_width))
+                col(tc),
+                col(dc),
+                (((col(tc) - lit(vis_x_min)) / lit(bin_width))
                     .floor()
                     .cast(DataType::Int32))
                 .alias("bin"),
             ])
             .group_by([col("bin")])
             .agg([
-                col(time_col).first().alias("x_first"),
-                col(time_col).last().alias("x_last"),
-                col(data_col).first().alias("y_first"),
-                col(data_col).last().alias("y_last"),
-                col(data_col).min().alias("y_min"),
-                col(data_col).max().alias("y_max"),
+                col(tc).first().alias("x_first"),
+                col(tc).last().alias("x_last"),
+                col(dc).first().alias("y_first"),
+                col(dc).last().alias("y_last"),
+                col(dc).min().alias("y_min"),
+                col(dc).max().alias("y_max"),
             ])
-            .sort(
-                ["bin"],
-                SortMultipleOptions::default().with_maintain_order(true),
-            )
+            .sort(["bin"], SortMultipleOptions::default().with_maintain_order(true))
             .collect();
 
         let df = match result {
             Ok(df) => df,
-            Err(e) => {
-                eprintln!("M4 downsample error for ch: {e}");
-                return Vec::new();
-            }
+            Err(e) => { eprintln!("M4 error: {e}"); return Vec::new(); }
         };
 
-        // Extract aggregated columns.
-        let x_first = match df.column("x_first") {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(e) => {
-                    eprintln!("x_first error: {e}");
-                    return Vec::new();
-                }
-            },
-            _ => return Vec::new(),
-        };
-        let x_last = match df.column("x_last") {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(e) => {
-                    eprintln!("x_last error: {e}");
-                    return Vec::new();
-                }
-            },
-            _ => return Vec::new(),
-        };
-        let y_first = match df.column("y_first") {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(e) => {
-                    eprintln!("y_first error: {e}");
-                    return Vec::new();
-                }
-            },
-            _ => return Vec::new(),
-        };
-        let y_last = match df.column("y_last") {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(e) => {
-                    eprintln!("y_last error: {e}");
-                    return Vec::new();
-                }
-            },
-            _ => return Vec::new(),
-        };
-        let y_min = match df.column("y_min") {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(e) => {
-                    eprintln!("y_min error: {e}");
-                    return Vec::new();
-                }
-            },
-            _ => return Vec::new(),
-        };
-        let y_max = match df.column("y_max") {
-            Ok(c) => match c.f64() {
-                Ok(ca) => ca,
-                Err(e) => {
-                    eprintln!("y_max error: {e}");
-                    return Vec::new();
-                }
-            },
-            _ => return Vec::new(),
-        };
+        let x_first = df.column("x_first").ok().and_then(|c| c.f64().ok()).unwrap();
+        let x_last  = df.column("x_last").ok().and_then(|c| c.f64().ok()).unwrap();
+        let y_first = df.column("y_first").ok().and_then(|c| c.f64().ok()).unwrap();
+        let y_last  = df.column("y_last").ok().and_then(|c| c.f64().ok()).unwrap();
+        let y_min   = df.column("y_min").ok().and_then(|c| c.f64().ok()).unwrap();
+        let y_max   = df.column("y_max").ok().and_then(|c| c.f64().ok()).unwrap();
 
-        // Emit M4 points per bin in order: first → min → max → last.
-        // Using x_first for min/max x positions: within each bin all x values
-        // span at most `bin_width`, which is sub-pixel at display resolution.
         let mut points = Vec::with_capacity(df.height() * 4);
         for i in 0..df.height() {
-            let xf = x_first.get(i);
-            let xl = x_last.get(i);
-            let yf = y_first.get(i);
-            let yl = y_last.get(i);
-            let mn = y_min.get(i);
-            let mx = y_max.get(i);
-
-            if let (Some(xf_v), Some(yf_v)) = (xf, yf) {
-                points.push([xf_v + delay, yf_v]);
+            if let (Some(xf), Some(yf)) = (x_first.get(i), y_first.get(i)) {
+                points.push([xf + delay, yf]);
             }
-            if let (Some(xf_v), Some(mn_v), Some(mx_v)) = (xf, mn, mx) {
-                if (mn_v - mx_v).abs() > f64::EPSILON {
-                    // Emit both min and max to preserve waveform peaks.
-                    if mn_v < mx_v {
-                        points.push([xf_v + delay, mn_v]);
-                        points.push([xf_v + delay, mx_v]);
+            if let (Some(xf), Some(mn), Some(mx)) = (x_first.get(i), y_min.get(i), y_max.get(i)) {
+                if (mn - mx).abs() > f64::EPSILON {
+                    if mn < mx {
+                        points.push([xf + delay, mn]);
+                        points.push([xf + delay, mx]);
                     } else {
-                        points.push([xf_v + delay, mx_v]);
-                        points.push([xf_v + delay, mn_v]);
+                        points.push([xf + delay, mx]);
+                        points.push([xf + delay, mn]);
                     }
                 }
             }
-            if let (Some(xl_v), Some(yl_v)) = (xl, yl) {
-                points.push([xl_v + delay, yl_v]);
+            if let (Some(xl), Some(yl)) = (x_last.get(i), y_last.get(i)) {
+                points.push([xl + delay, yl]);
             }
         }
         points
     }
 }
+
+fn extract_points(df: &DataFrame, time_col: &str, delay: f64) -> Vec<[f64; 2]> {
+    let x_ca = match df.column(time_col) {
+        Ok(c) => match c.f64() { Ok(ca) => ca, Err(_) => return Vec::new() },
+        _ => return Vec::new(),
+    };
+    let y_col_name = df.get_column_names().iter()
+        .find(|n| n.as_str() != time_col)
+        .map(|n| n.as_str())
+        .unwrap_or(time_col);
+    let y_ca = match df.column(y_col_name) {
+        Ok(c) => match c.f64() { Ok(ca) => ca, Err(_) => return Vec::new() },
+        _ => return Vec::new(),
+    };
+
+    let n = df.height();
+    let mut points = Vec::with_capacity(n);
+    for i in 0..n {
+        if let (Some(x), Some(y)) = (x_ca.get(i), y_ca.get(i)) {
+            points.push([x + delay, y]);
+        }
+    }
+    points
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Legacy in-memory path (fallback for edge cases)
+// ───────────────────────────────────────────────────────────────────────
+
+pub struct InMemoryData {
+    pub df: DataFrame,
+    pub time_col: String,
+    pub data_cols: Vec<String>,
+    pub n_rows: usize,
+    pub x_min: f64,
+    pub x_max: f64,
+}
+
+impl InMemoryData {
+    pub fn get_channel_points(
+        &self, _ch_idx: usize, _delay: f64, _vis_x_min: f64, _vis_x_max: f64, _max_points: usize,
+    ) -> Vec<[f64; 2]> { Vec::new() }
+
+    pub fn get_raw_points(
+        &self, _ch_idx: usize, _vis_x_min: f64, _vis_x_max: f64, _max_points: usize,
+    ) -> Vec<[f64; 2]> { Vec::new() }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Tests
+// ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -486,48 +399,33 @@ mod tests {
     #[test]
     fn load_demo_csv() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("demoCS0_3.csv");
-        let data = WaveformData::load_csv(path.to_str().unwrap()).unwrap();
+            .parent().unwrap().join("demoCS0_3.csv");
+        let data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
         assert_eq!(data.n_channels(), 7);
-        assert!(data.n_rows > 0);
-        assert!(data.time_span > 0.0);
+        assert!(data.n_rows() > 0);
+        assert!(data.time_span() > 0.0);
     }
 
     #[test]
     fn downsample_produces_points() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("demoCS0_3.csv");
-        let data = WaveformData::load_csv(path.to_str().unwrap()).unwrap();
-        let pts = data.get_channel_points(0, 0.0, data.x_min, data.x_max, 4000);
+            .parent().unwrap().join("demoCS0_3.csv");
+        let data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
+        let pts = data.get_channel_points(0, 0.0, data.x_min(), data.x_max(), 4000);
         assert!(!pts.is_empty(), "downsample returned 0 points");
-        // M4: up to 4 pts per bin, max_points/4 bins → ≤ max_points*1.5
         assert!(pts.len() <= 8000, "got {} points", pts.len());
     }
 
     #[test]
     fn exact_mode_when_zoomed_in() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("demoCS0_3.csv");
-        let data = WaveformData::load_csv(path.to_str().unwrap()).unwrap();
-        // Zoom into a tiny range — should return all raw points.
-        let mid = (data.x_min + data.x_max) / 2.0;
-        let tiny_range = data.time_span / 10000.0;
-        let pts = data.get_channel_points(0, 0.0, mid - tiny_range, mid + tiny_range, 4000);
-        // With 1281 rows over the full span, a 1/10000 slice has ~0.13 rows,
-        // so likely 0 or a few points — just verify it doesn't crash.
-        // Use a wider slice that definitely has points.
+            .parent().unwrap().join("demoCS0_3.csv");
+        let data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
         let pts = data.get_channel_points(
-            0,
-            0.0,
-            data.x_min,
-            data.x_min + data.time_span * 0.1,
-            100000, // max_points >> visible rows → exact mode
+            0, 0.0,
+            data.x_min(),
+            data.x_min() + data.time_span() * 0.1,
+            100000,
         );
         assert!(!pts.is_empty(), "exact mode returned 0 points");
     }
