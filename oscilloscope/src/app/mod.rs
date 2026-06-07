@@ -26,6 +26,8 @@ use crate::fft_analysis;
 use crate::math_channel::{MathChannelDef, MathOp};
 use crate::measurement::Measurements;
 
+use eye_diagram::{ClockPolarity, EyeColorMode, EyeDiagramState};
+
 // ---------- constants ----------
 
 pub(crate) const CHANNEL_COLORS: [Color32; 8] = [
@@ -163,31 +165,30 @@ pub struct OscilloscopeApp {
     pub(crate) xy_ch_x: usize,
     pub(crate) xy_ch_y: usize,
 
+    // --- Eye diagram ---
+    pub(crate) show_eye_window: bool,
+    pub(crate) eye_channel: usize,
+    pub(crate) eye_clock_channel: Option<usize>,
+    pub(crate) eye_clock_polarity: ClockPolarity,
+    pub(crate) eye_ui_period: f64,
+    pub(crate) eye_ui_period_str: String,
+    pub(crate) eye_auto_threshold: bool,
+    pub(crate) eye_n_ui: usize,
+    pub(crate) eye_color_mode: EyeColorMode,
+    pub(crate) eye_grid_x: usize,
+    pub(crate) eye_grid_y: usize,
+    pub(crate) eye_saturation: f64,
+    pub(crate) eye_needs_recompute: bool,
+    pub(crate) eye_state: Option<EyeDiagramState>,
+    /// Previous visible bounds when eye diagram was last computed.
+    pub(crate) eye_prev_bounds: PlotBounds,
+
     // --- Math dialog ---
     pub(crate) show_math_dialog: bool,
     pub(crate) math_new_op: MathOp,
     pub(crate) math_new_src_a: usize,
     pub(crate) math_new_src_b: usize,
     pub(crate) pending_math_remove: Option<usize>,
-
-    // --- Eye diagram ---
-    pub(crate) show_eye_window: bool,
-    pub(crate) eye_channel: usize,
-    pub(crate) eye_ui_period: f64,
-    pub(crate) eye_ui_period_str: String,
-    pub(crate) eye_grid_x: usize,
-    pub(crate) eye_grid_y: usize,
-    pub(crate) eye_color_mode: eye_diagram::EyeColorMode,
-    pub(crate) eye_state: Option<eye_diagram::EyeDiagramState>,
-    pub(crate) eye_needs_recompute: bool,
-    pub(crate) eye_auto_threshold: bool,
-    pub(crate) eye_n_ui: usize,
-    /// External clock channel (None = self-clocking from signal channel).
-    pub(crate) eye_clock_channel: Option<usize>,
-    /// Clock edge polarity (Rising / Falling / Both).
-    pub(crate) eye_clock_polarity: eye_diagram::ClockPolarity,
-    /// Saturation level for eye normalisation (1.0 = normal, >1 = over-saturated).
-    pub(crate) eye_saturation: f32,
 
     // --- Async file dialog channels (macOS crash workaround) ---
     /// Receiver for open-file dialog results.
@@ -247,26 +248,27 @@ impl Default for OscilloscopeApp {
             xy_ch_x: 0,
             xy_ch_y: 1,
 
+            show_eye_window: false,
+            eye_channel: 0,
+            eye_clock_channel: None,
+            eye_clock_polarity: ClockPolarity::Rising,
+            eye_ui_period: 1e-9,
+            eye_ui_period_str: "1e-9".to_owned(),
+            eye_auto_threshold: false,
+            eye_n_ui: 3,
+            eye_color_mode: EyeColorMode::Phosphor,
+            eye_grid_x: 512,
+            eye_grid_y: 256,
+            eye_saturation: 2.0,
+            eye_needs_recompute: false,
+            eye_state: None,
+            eye_prev_bounds: PlotBounds::NOTHING,
+
             show_math_dialog: false,
             math_new_op: MathOp::Add,
             math_new_src_a: 0,
             math_new_src_b: 1,
             pending_math_remove: None,
-
-            show_eye_window: false,
-            eye_channel: 0,
-            eye_ui_period: 1e-9,
-            eye_ui_period_str: "1e-9".to_owned(),
-            eye_grid_x: 512,
-            eye_grid_y: 256,
-            eye_color_mode: eye_diagram::EyeColorMode::Monochrome,
-            eye_state: None,
-            eye_needs_recompute: false,
-            eye_auto_threshold: false,
-            eye_n_ui: 3,
-            eye_clock_channel: None,
-            eye_clock_polarity: eye_diagram::ClockPolarity::Rising,
-            eye_saturation: 1.0,
 
             // Async file dialog channels
             open_file_rx: std::sync::mpsc::channel().1,

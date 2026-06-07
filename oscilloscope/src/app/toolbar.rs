@@ -162,7 +162,6 @@ impl OscilloscopeApp {
                     // Eye Diagram
                     if ui.button("Eye").clicked() {
                         self.show_eye_window = true;
-                        self.eye_needs_recompute = true;
                     }
 
                     // Math channel

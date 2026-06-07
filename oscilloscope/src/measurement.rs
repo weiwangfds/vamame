@@ -46,43 +46,59 @@ impl Default for Measurements {
 }
 
 /// Maximum raw points for time-domain measurement calculations.
-const MEASUREMENT_MAX_POINTS: usize = 200_000;
+const MEASUREMENT_MAX_POINTS: usize = 50_000;
 
 impl Measurements {
     /// Compute all measurements for a channel in the visible x-range.
+    ///
+    /// Statistical measurements (vmax, vmin, vpp, vmean, vrms) are computed
+    /// directly from Parquet via fast aggregations.  Time-domain measurements
+    /// (frequency, rise time, etc.) still need raw sample points but are
+    /// limited to `MEASUREMENT_MAX_POINTS`.
     pub fn compute(data: &WaveformData, ch_idx: usize, vis_x_min: f64, vis_x_max: f64) -> Self {
         let mut m = Self::default();
 
-        // --- Raw points (works for both Parquet and InMemory paths) ---
+        // --- Statistical measurements via Parquet aggregation (fast path) ---
+        if let Some((vmin, vmax, vmean, vrms, n)) =
+            data.compute_channel_stats(ch_idx, vis_x_min, vis_x_max)
+        {
+            if n >= 2 {
+                m.vmin = vmin;
+                m.vmax = vmax;
+                m.vpp = vmax - vmin;
+                m.vmean = vmean;
+                m.vrms = vrms;
+            }
+        }
+
+        // --- Time-domain measurements from raw points (limited) ---
         let points = data.get_raw_points(ch_idx, vis_x_min, vis_x_max, MEASUREMENT_MAX_POINTS);
-        if points.len() < 2 {
+        if points.len() < 4 {
+            // Fill stats from raw points if aggregation failed
+            if m.vpp.is_nan() && points.len() >= 2 {
+                let y_vals: Vec<f64> = points.iter().map(|p| p[1]).collect();
+                let vmax = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let vmin = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                let sum: f64 = y_vals.iter().sum();
+                let sum_sq: f64 = y_vals.iter().map(|v| v * v).sum();
+                let n = y_vals.len() as f64;
+                m.vmax = vmax;
+                m.vmin = vmin;
+                m.vpp = vmax - vmin;
+                m.vmean = sum / n;
+                m.vrms = (sum_sq / n).sqrt();
+            }
             return m;
         }
 
-        // --- Statistical measurements from raw points ---
-        let y_vals: Vec<f64> = points.iter().map(|p| p[1]).collect();
-        let vmax = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let vmin = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
-        let sum: f64 = y_vals.iter().sum();
-        let sum_sq: f64 = y_vals.iter().map(|v| v * v).sum();
-        let n = y_vals.len() as f64;
-        m.vmax = vmax;
-        m.vmin = vmin;
-        m.vpp = vmax - vmin;
-        m.vmean = sum / n;
-        m.vrms = (sum_sq / n).sqrt();
-
-        // --- Time-domain measurements from raw points ---
-        if points.len() >= 4 {
-            let td = compute_time_domain(&points);
-            m.frequency = td.frequency;
-            m.period = td.period;
-            m.rise_time = td.rise_time;
-            m.fall_time = td.fall_time;
-            m.duty_cycle = td.duty_cycle;
-            m.pos_width = td.pos_width;
-            m.neg_width = td.neg_width;
-        }
+        let td = compute_time_domain(&points);
+        m.frequency = td.frequency;
+        m.period = td.period;
+        m.rise_time = td.rise_time;
+        m.fall_time = td.fall_time;
+        m.duty_cycle = td.duty_cycle;
+        m.pos_width = td.pos_width;
+        m.neg_width = td.neg_width;
 
         m
     }

@@ -6,3 +6,9 @@ oscilloscope/target
 .oscv/
 *.csv
 screenshot.png
+
+# Temp images
+*.jpg
+*.jpeg
+*.png
+!docs/images/*.png
