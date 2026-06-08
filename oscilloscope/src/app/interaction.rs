@@ -181,6 +181,10 @@ impl OscilloscopeApp {
             self.strips.push(Strip {
                 channel_indices: vec![ch_idx],
                 height: 150.0,
+                y_mode: super::YAxisMode::Linked,
+                y_min: -1.0,
+                y_max: 1.0,
+                y_offset: 0.0,
             });
         }
         self.status_message = format!(
@@ -206,6 +210,10 @@ impl OscilloscopeApp {
                 Strip {
                     channel_indices: vec![idx],
                     height: h,
+                    y_mode: super::YAxisMode::Linked,
+                    y_min: -1.0,
+                    y_max: 1.0,
+                y_offset: 0.0,
                 },
             );
         }

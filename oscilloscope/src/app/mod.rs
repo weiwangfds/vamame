@@ -52,28 +52,133 @@ pub(crate) const CURSOR_HIT_PX: f32 = 6.0;
 
 // ---------- data model ----------
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TimeUnit {
+    Ps,
+    Ns,
+    Us,
+    Ms,
+    S,
+}
+
+impl TimeUnit {
+    pub fn suffix(&self) -> &'static str {
+        match self {
+            TimeUnit::Ps => "ps",
+            TimeUnit::Ns => "ns",
+            TimeUnit::Us => "μs",
+            TimeUnit::Ms => "ms",
+            TimeUnit::S => "s",
+        }
+    }
+
+    /// Convert a value in seconds to this unit.
+    pub fn from_seconds(&self, s: f64) -> f64 {
+        match self {
+            TimeUnit::Ps => s * 1e12,
+            TimeUnit::Ns => s * 1e9,
+            TimeUnit::Us => s * 1e6,
+            TimeUnit::Ms => s * 1e3,
+            TimeUnit::S => s,
+        }
+    }
+
+    /// Convert a value in this unit to seconds.
+    pub fn to_seconds(&self, v: f64) -> f64 {
+        match self {
+            TimeUnit::Ps => v * 1e-12,
+            TimeUnit::Ns => v * 1e-9,
+            TimeUnit::Us => v * 1e-6,
+            TimeUnit::Ms => v * 1e-3,
+            TimeUnit::S => v,
+        }
+    }
+
+    pub fn all() -> &'static [TimeUnit] {
+        &[TimeUnit::Ps, TimeUnit::Ns, TimeUnit::Us, TimeUnit::Ms, TimeUnit::S]
+    }
+}
+
+impl std::fmt::Display for TimeUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.suffix())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum VoltageUnit {
+    V,
+    Mv,
+}
+
+impl VoltageUnit {
+    pub fn suffix(&self) -> &'static str {
+        match self {
+            VoltageUnit::V => "V",
+            VoltageUnit::Mv => "mV",
+        }
+    }
+
+    /// Convert a value in Volts to this unit.
+    pub fn from_volts(&self, v: f64) -> f64 {
+        match self {
+            VoltageUnit::V => v,
+            VoltageUnit::Mv => v * 1e3,
+        }
+    }
+
+    /// Convert a value in this unit to Volts.
+    pub fn to_volts(&self, v: f64) -> f64 {
+        match self {
+            VoltageUnit::V => v,
+            VoltageUnit::Mv => v * 1e-3,
+        }
+    }
+
+    pub fn all() -> &'static [VoltageUnit] {
+        &[VoltageUnit::V, VoltageUnit::Mv]
+    }
+}
+
+impl std::fmt::Display for VoltageUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.suffix())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ChannelState {
     pub name: String,
     pub visible: bool,
     pub delay: f64,
+    pub delay_unit: TimeUnit,
     pub color: Color32,
-    /// Whether the voltage threshold reference line is shown for this channel.
     pub threshold_enabled: bool,
-    /// The voltage threshold value (in Volts).
     pub threshold_value: f64,
-    /// Whether the binarized (square wave) view is shown for this channel.
+    pub threshold_unit: VoltageUnit,
     pub binarize_enabled: bool,
-    /// When binarize is active, hide the original analog waveform.
     pub binarize_hide_original: bool,
-    /// String buffer for the threshold text input.
-    pub threshold_text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum YAxisMode {
+    /// All strips share the same Y range (linked).
+    Linked,
+    /// Each strip auto-adjusts its own Y range.
+    Auto,
+    /// User manually sets Y min/max per strip.
+    Manual,
 }
 
 #[derive(Clone)]
 pub(crate) struct Strip {
     pub channel_indices: Vec<usize>,
     pub height: f32,
+    pub y_mode: YAxisMode,
+    pub y_min: f64,
+    pub y_max: f64,
+    /// Vertical offset for Linked mode: shifts the waveform up/down per strip.
+    pub y_offset: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +211,10 @@ impl StripCache {
 pub struct OscilloscopeApp {
     pub(crate) channels: Vec<ChannelState>,
     pub(crate) strips: Vec<Strip>,
+
+    /// Global Y-axis range for Linked mode: center and half-span.
+    pub(crate) y_linked_center: f64,
+    pub(crate) y_linked_half_span: f64,
 
     /// Polars-backed waveform data.
     pub(crate) data: Option<WaveformData>,
@@ -225,6 +334,8 @@ impl Default for OscilloscopeApp {
         Self {
             channels: Vec::new(),
             strips: Vec::new(),
+            y_linked_center: 0.0,
+            y_linked_half_span: 1.0,
             data: None,
             cache: Vec::new(),
             last_bounds: PlotBounds::NOTHING,
@@ -344,12 +455,13 @@ impl OscilloscopeApp {
                             name: format!("CH{}", i + 1),
                             visible: true,
                             delay: 0.0,
+                            delay_unit: TimeUnit::Ps,
                             color: CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
                             threshold_enabled: false,
                             threshold_value: 0.0,
+                            threshold_unit: VoltageUnit::V,
                             binarize_enabled: false,
                             binarize_hide_original: false,
-                            threshold_text: "0.0".to_owned(),
                         })
                         .collect();
 
@@ -357,6 +469,10 @@ impl OscilloscopeApp {
                         .map(|_| Strip {
                             channel_indices: vec![0],
                             height: 150.0,
+                            y_mode: YAxisMode::Linked,
+                            y_min: -1.0,
+                            y_max: 1.0,
+                            y_offset: 0.0,
                         })
                         .collect();
                     for (i, s) in self.strips.iter_mut().enumerate() {

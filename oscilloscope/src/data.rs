@@ -7,6 +7,7 @@
 //! are read from disk, keeping memory usage constant.
 
 pub mod cache;
+#[allow(dead_code)]
 pub mod indexed;
 
 use polars::prelude::*;
@@ -18,6 +19,7 @@ pub enum WaveformData {
     /// Parquet-backed with lazy scan queries.
     Parquet(ParquetData),
     /// Legacy Polars in-memory (small files, fallback).
+    #[allow(dead_code)]
     InMemory(InMemoryData),
 }
 

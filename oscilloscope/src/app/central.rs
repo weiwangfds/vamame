@@ -4,13 +4,14 @@
 //! Strips share a linked x-axis for synchronised zoom/pan.
 
 use egui::{Color32, Frame, Id, RichText, Sense, Vec2b};
-use egui_plot::{Corner, CoordinatesFormatter, Legend, Line, Plot, PlotPoints};
+use egui_plot::{AxisHints, Corner, CoordinatesFormatter, Legend, Line, Plot, PlotPoints};
 
 use crate::cursor::CursorMode;
 use crate::measurement::Measurements;
 
 use super::{
-    cursor_lines, DragPayload, OscilloscopeApp, Strip, MIN_STRIP_HEIGHT,
+    cursor_lines, DragPayload, OscilloscopeApp, Strip, TimeUnit, VoltageUnit, YAxisMode,
+    MIN_STRIP_HEIGHT,
 };
 
 impl OscilloscopeApp {
@@ -63,6 +64,25 @@ impl OscilloscopeApp {
                     let cursor_mode = self.cursor.mode;
                     let cursor_a = self.cursor.pos_a;
                     let cursor_b = self.cursor.pos_b;
+
+                    // ---- Compute global Y range for Linked mode ----
+                    if initial_fit {
+                        let mut global_y_min = f64::INFINITY;
+                        let mut global_y_max = f64::NEG_INFINITY;
+                        for cache_item in &self.cache {
+                            if let Some(ref c) = cache_item {
+                                for p in &c.points {
+                                    if p[1] < global_y_min { global_y_min = p[1]; }
+                                    if p[1] > global_y_max { global_y_max = p[1]; }
+                                }
+                            }
+                        }
+                        if global_y_min.is_finite() && global_y_max.is_finite() {
+                            let margin = (global_y_max - global_y_min) * 0.1;
+                            self.y_linked_center = (global_y_min + global_y_max) / 2.0;
+                            self.y_linked_half_span = (global_y_max - global_y_min) / 2.0 + margin;
+                        }
+                    }
 
                     for s_idx in 0..self.strips.len() {
                         let mut split_requested = false;
@@ -143,16 +163,36 @@ impl OscilloscopeApp {
                                     }
                                 }
 
-                                // -- delay --
+                                // -- delay unit selector --
                                 ui.label(RichText::new("d:").small().color(Color32::GRAY));
-                                let max_delay = time_span * 0.5;
-                                ui.add(
-                                    egui::DragValue::new(&mut self.channels[ch_idx].delay)
-                                        .range(-max_delay..=max_delay)
-                                        .speed(time_span * 0.001)
-                                        .fixed_decimals(2)
-                                        .suffix("s"),
-                                );
+                                {
+                                    let unit = self.channels[ch_idx].delay_unit;
+                                    let max_delay = time_span * 0.5;
+                                    let mut delay_display = unit.from_seconds(self.channels[ch_idx].delay);
+                                    let max_display = unit.from_seconds(max_delay);
+                                    let speed_display = unit.from_seconds(time_span * 0.001);
+                                    ui.add(
+                                        egui::DragValue::new(&mut delay_display)
+                                            .range(-max_display..=max_display)
+                                            .speed(speed_display)
+                                            .fixed_decimals(2)
+                                            .suffix(unit.suffix()),
+                                    );
+                                    self.channels[ch_idx].delay = unit.to_seconds(delay_display);
+
+                                    egui::ComboBox::from_id_salt(ui.id().with("delay_unit").with(ch_idx))
+                                        .selected_text(unit.suffix())
+                                        .width(40.0)
+                                        .show_ui(ui, |ui| {
+                                            for &u in TimeUnit::all() {
+                                                ui.selectable_value(
+                                                    &mut self.channels[ch_idx].delay_unit,
+                                                    u,
+                                                    u.suffix(),
+                                                );
+                                            }
+                                        });
+                                }
 
                                 // -- remove from strip --
                                 if ui
@@ -211,18 +251,37 @@ impl OscilloscopeApp {
                                 }
                                 let ch_color = self.channels[ch_idx].color;
 
-                                // -- threshold value input (always visible) --
+                                // -- threshold value input with unit selector --
                                 ui.label(
                                     RichText::new(format!("{} Vth:", self.channels[ch_idx].name))
                                         .small()
                                         .color(ch_color),
                                 );
-                                ui.add(
-                                    egui::DragValue::new(&mut self.channels[ch_idx].threshold_value)
-                                        .speed(0.01)
-                                        .fixed_decimals(3)
-                                        .suffix(" V"),
-                                );
+                                {
+                                    let unit = self.channels[ch_idx].threshold_unit;
+                                    let mut thresh_display = unit.from_volts(self.channels[ch_idx].threshold_value);
+                                    let speed_display = unit.from_volts(0.01);
+                                    ui.add(
+                                        egui::DragValue::new(&mut thresh_display)
+                                            .speed(speed_display)
+                                            .fixed_decimals(3)
+                                            .suffix(unit.suffix()),
+                                    );
+                                    self.channels[ch_idx].threshold_value = unit.to_volts(thresh_display);
+
+                                    egui::ComboBox::from_id_salt(ui.id().with("vth_unit").with(ch_idx))
+                                        .selected_text(unit.suffix())
+                                        .width(40.0)
+                                        .show_ui(ui, |ui| {
+                                            for &u in VoltageUnit::all() {
+                                                ui.selectable_value(
+                                                    &mut self.channels[ch_idx].threshold_unit,
+                                                    u,
+                                                    u.suffix(),
+                                                );
+                                            }
+                                        });
+                                }
 
                                 // -- threshold line visibility toggle --
                                 let thresh_text = if self.channels[ch_idx].threshold_enabled {
@@ -285,6 +344,80 @@ impl OscilloscopeApp {
                             }
                         });
 
+                        // ======== Y-axis controls (third row) ========
+                        ui.horizontal_wrapped(|ui| {
+                            let y_mode = self.strips[s_idx].y_mode;
+
+                            // -- Linked button --
+                            let linked_color = if y_mode == YAxisMode::Linked {
+                                Color32::from_rgb(100, 180, 255)
+                            } else {
+                                Color32::GRAY
+                            };
+                            if ui
+                                .button(RichText::new("Y: Linked").small().color(linked_color))
+                                .on_hover_text("All strips share the same Y scale")
+                                .clicked()
+                            {
+                                self.strips[s_idx].y_mode = YAxisMode::Linked;
+                            }
+
+                            // -- Auto button --
+                            let auto_color = if y_mode == YAxisMode::Auto {
+                                Color32::from_rgb(0, 200, 100)
+                            } else {
+                                Color32::GRAY
+                            };
+                            if ui
+                                .button(RichText::new("Auto").small().color(auto_color))
+                                .on_hover_text("Auto-adjust Y range per strip")
+                                .clicked()
+                            {
+                                self.strips[s_idx].y_mode = YAxisMode::Auto;
+                            }
+
+                            // -- Manual button --
+                            let manual_color = if y_mode == YAxisMode::Manual {
+                                Color32::from_rgb(255, 200, 80)
+                            } else {
+                                Color32::GRAY
+                            };
+                            if ui
+                                .button(RichText::new("Manual").small().color(manual_color))
+                                .on_hover_text("Manually set Y min/max for this strip")
+                                .clicked()
+                            {
+                                self.strips[s_idx].y_mode = YAxisMode::Manual;
+                            }
+
+                            // -- Min/Max inputs for Manual mode --
+                            if y_mode == YAxisMode::Manual {
+                                ui.label(RichText::new("min:").small().color(Color32::GRAY));
+                                ui.add(
+                                    egui::DragValue::new(&mut self.strips[s_idx].y_min)
+                                        .speed(0.01)
+                                        .fixed_decimals(3),
+                                );
+                                ui.label(RichText::new("max:").small().color(Color32::GRAY));
+                                ui.add(
+                                    egui::DragValue::new(&mut self.strips[s_idx].y_max)
+                                        .speed(0.01)
+                                        .fixed_decimals(3),
+                                );
+                            }
+
+                            // -- Offset display for Linked mode --
+                            if y_mode == YAxisMode::Linked {
+                                ui.label(RichText::new("offset:").small().color(Color32::GRAY));
+                                ui.add(
+                                    egui::DragValue::new(&mut self.strips[s_idx].y_offset)
+                                        .speed(0.01)
+                                        .fixed_decimals(3)
+                                        .suffix(" V"),
+                                );
+                            }
+                        });
+
                         // ======== ensure cache ========
                         let strip_chs = self.strips[s_idx].channel_indices.clone();
                         for &ch_idx in &strip_chs {
@@ -303,6 +436,21 @@ impl OscilloscopeApp {
                             let plot_id = ui.id().with("strip_plot").with(s_idx);
                             let show_x_axis = s_idx == self.strips.len() - 1;
 
+                            // Determine Y-axis control mode for this strip.
+                            let strip = &self.strips[s_idx];
+                            let y_mode = strip.y_mode;
+                            let all_binarize_hide = strip_chs.iter().all(|&ch_idx| {
+                                ch_idx < self.channels.len()
+                                    && self.channels[ch_idx].binarize_enabled
+                                    && self.channels[ch_idx].binarize_hide_original
+                            });
+                            let y_min_strip = strip.y_min;
+                            let y_max_strip = strip.y_max;
+                            let y_offset_strip = strip.y_offset;
+
+                            let allow_y_drag = (y_mode == YAxisMode::Linked || y_mode == YAxisMode::Auto)
+                                && !all_binarize_hide;
+
                             let plot = Plot::new(plot_id)
                                 .legend(Legend::default().position(Corner::RightTop))
                                 .show_axes(Vec2b::new(show_x_axis, true))
@@ -311,7 +459,14 @@ impl OscilloscopeApp {
                                 .link_cursor(cursor_link_id, Vec2b::new(true, false))
                                 .allow_zoom(Vec2b::new(true, false))
                                 .allow_scroll(Vec2b::new(true, false))
-                                .allow_drag(Vec2b::new(true, false))
+                                .allow_drag(Vec2b::new(true, allow_y_drag))
+                                .custom_y_axes(vec![
+                                    AxisHints::new_y()
+                                        .label("V")
+                                        .formatter(|mark, _range| {
+                                            format_voltage(mark.value)
+                                        })
+                                ])
                                 .y_axis_min_width(80.0)
                                 .coordinates_formatter(
                                     Corner::LeftBottom,
@@ -329,21 +484,37 @@ impl OscilloscopeApp {
                                     }),
                                 )
                                 .x_axis_label(if show_x_axis { "Time (s)" } else { "" })
-                                .y_axis_label("V")
                                 .height(strip_height);
 
-                            // When cursors are active, freeze Y auto-bounds so that
-                            // the cursor line extension (±huge value) doesn't inflate
-                            // the Y range and make the waveform invisible.
-                            let y_auto = cursor_mode == CursorMode::Off;
+                            let y_auto_cursor = cursor_mode == CursorMode::Off;
+                            let y_offset_before = y_offset_strip;
 
                             let plot_response = plot.show(ui, |plot_ui| {
                                 if initial_fit {
                                     plot_ui.set_auto_bounds(Vec2b::new(true, true));
                                 } else if undo_zoom {
                                     plot_ui.set_plot_bounds(undo_bounds);
-                                } else {
-                                    plot_ui.set_auto_bounds(Vec2b::new(false, y_auto));
+                                } else if all_binarize_hide {
+                                    plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                        [self.last_bounds.min()[0], -0.1],
+                                        [self.last_bounds.max()[0], 1.1],
+                                    ));
+                                } else if y_mode == YAxisMode::Linked {
+                                    let center = self.y_linked_center + y_offset_strip;
+                                    let half = self.y_linked_half_span;
+                                    plot_ui.set_auto_bounds(Vec2b::new(false, false));
+                                    plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                        [self.last_bounds.min()[0], center - half],
+                                        [self.last_bounds.max()[0], center + half],
+                                    ));
+                                } else if y_mode == YAxisMode::Manual {
+                                    plot_ui.set_auto_bounds(Vec2b::new(false, false));
+                                    plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                        [self.last_bounds.min()[0], y_min_strip],
+                                        [self.last_bounds.max()[0], y_max_strip],
+                                    ));
+                                } else if y_mode == YAxisMode::Auto {
+                                    plot_ui.set_auto_bounds(Vec2b::new(false, y_auto_cursor));
                                 }
 
                                 for &ch_idx in &strip_chs {
@@ -369,8 +540,6 @@ impl OscilloscopeApp {
                                         // --- Threshold reference line (red dashed) ---
                                         if ch.threshold_enabled || ch.binarize_enabled {
                                             let bounds = plot_ui.plot_bounds();
-                                            // Use visible X range only — no ±1e6 expansion,
-                                            // which causes auto-bounds oscillation.
                                             let x_min = bounds.min()[0];
                                             let x_max = bounds.max()[0];
                                             let thresh = ch.threshold_value;
@@ -423,6 +592,20 @@ impl OscilloscopeApp {
                             // --- Handle cursor drag interaction ---
                             if cursor_mode != CursorMode::Off {
                                 self.handle_cursor_interaction(&plot_response, s_idx);
+                            }
+
+                            // --- Handle vertical drag for per-strip Y offset ---
+                            if y_mode == YAxisMode::Linked && !all_binarize_hide {
+                                let response = &plot_response.response;
+                                if response.dragged() {
+                                    let dy_screen = response.drag_delta().y;
+                                    let y_span = self.y_linked_half_span * 2.0;
+                                    let plot_height = response.rect.height();
+                                    if plot_height > 0.0 {
+                                        let dy_data = -dy_screen as f64 * y_span / plot_height as f64;
+                                        self.strips[s_idx].y_offset = y_offset_before + dy_data;
+                                    }
+                                }
                             }
 
                             let bounds = plot_response.transform.bounds();
@@ -483,6 +666,10 @@ impl OscilloscopeApp {
                                     Strip {
                                         channel_indices: vec![ch_idx],
                                         height: strip_height,
+                                        y_mode: super::YAxisMode::Linked,
+                                        y_min: -1.0,
+                                        y_max: 1.0,
+                                        y_offset: 0.0,
                                     },
                                 );
                             }
@@ -546,7 +733,6 @@ impl OscilloscopeApp {
             }
 
             // Position: offset each channel's annotation block to avoid overlap.
-            // Place in the upper-left of the plot area, stacked vertically.
             let x_offset = plot_rect.left() + 8.0 + (ch_offset as f32) * 160.0;
             let y_start = plot_rect.top() + 6.0;
 
@@ -555,7 +741,6 @@ impl OscilloscopeApp {
 
             for (i, text) in lines.iter().enumerate() {
                 let pos = egui::pos2(x_offset, y_start + i as f32 * line_height);
-                // Draw a dark background for readability
                 let galley = ui.painter().layout_no_wrap(text.clone(), font_id.clone(), ch.color);
                 let text_rect = egui::Rect::from_min_max(
                     pos,
@@ -576,6 +761,18 @@ impl OscilloscopeApp {
 
 // ---------- helper functions ----------
 
+/// Format a voltage value with automatic unit selection (mV / V).
+fn format_voltage(v: f64) -> String {
+    let abs = v.abs();
+    if abs == 0.0 {
+        "0.000 V".to_owned()
+    } else if abs < 1.0 {
+        format!("{:.3} mV", v * 1e3)
+    } else {
+        format!("{:.3} V", v)
+    }
+}
+
 /// Extract the R component from a Color32.
 fn ch_color_r(c: Color32) -> u8 {
     c.r()
@@ -594,29 +791,18 @@ fn ch_color_b(c: Color32) -> u8 {
 /// Generate a binarized square-wave point sequence from sampled data.
 ///
 /// Uses the threshold to decide HIGH vs LOW:
-/// - value > threshold → HIGH
-/// - value ≤ threshold → LOW
+/// - value > threshold → 1.0 (HIGH)
+/// - value ≤ threshold → 0.0 (LOW)
 ///
-/// The square-wave amplitude is a small offset centered on the threshold
-/// so it does not distort the Y-axis.  Vertical edges are inserted at
-/// exact crossing times via linear interpolation for clean transitions.
+/// Vertical edges are inserted at exact crossing times via linear
+/// interpolation for clean transitions.
 fn generate_binarized_points(points: &[[f64; 2]], threshold: f64) -> Vec<[f64; 2]> {
     if points.len() < 2 {
         return Vec::new();
     }
 
-    // Compute half-amplitude from the signal's own range, but keep it
-    // modest (15% of p-p) so the square wave is visible yet doesn't
-    // obscure the original waveform.
-    let mut v_min = f64::INFINITY;
-    let mut v_max = f64::NEG_INFINITY;
-    for p in points {
-        if p[1] < v_min { v_min = p[1]; }
-        if p[1] > v_max { v_max = p[1]; }
-    }
-    let half_amp = ((v_max - v_min) * 0.15).max(0.05);
-    let v_high = threshold + half_amp;
-    let v_low = threshold - half_amp;
+    let v_high = 1.0;
+    let v_low = 0.0;
 
     let mut result = Vec::with_capacity(points.len() * 2);
 

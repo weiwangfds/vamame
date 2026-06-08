@@ -738,6 +738,7 @@ impl OscilloscopeApp {
     /// 2. Inter-crossing periods are sorted; the first ratio gap > 1.5
     ///    separates the true UI cluster from 2xUI, 3xUI runs.
     /// 3. Discard top/bottom 10% and average the rest.
+    #[allow(dead_code)]
     fn do_auto_detect_ui_period(&mut self) {
         let vis_x_min = self.last_bounds.min()[0];
         let vis_x_max = self.last_bounds.max()[0];

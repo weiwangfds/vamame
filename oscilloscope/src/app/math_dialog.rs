@@ -123,12 +123,13 @@ impl OscilloscopeApp {
                             name: def.display_name(&channel_names),
                             visible: true,
                             delay: 0.0,
+                            delay_unit: super::TimeUnit::Ps,
                             color,
                             threshold_enabled: false,
                             threshold_value: 0.0,
+                            threshold_unit: super::VoltageUnit::V,
                             binarize_enabled: false,
                             binarize_hide_original: false,
-                            threshold_text: "0.0".to_owned(),
                         });
                         self.math_channels.push(def);
                         self.cache.push(None);
@@ -137,6 +138,10 @@ impl OscilloscopeApp {
                         self.strips.push(Strip {
                             channel_indices: vec![math_idx],
                             height: 150.0,
+                            y_mode: super::YAxisMode::Linked,
+                            y_min: -1.0,
+                            y_max: 1.0,
+                            y_offset: 0.0,
                         });
 
                         self.status_message =
