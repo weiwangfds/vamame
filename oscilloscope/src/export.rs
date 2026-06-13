@@ -4,44 +4,48 @@ use crate::data::WaveformData;
 
 /// Export visible-range data for selected channels as CSV.
 pub fn export_csv(
-    data: &WaveformData,
+    data: &mut WaveformData,
     ch_indices: &[usize],
     vis_x_min: f64,
     vis_x_max: f64,
     path: &str,
 ) -> Result<(), String> {
-    use polars::prelude::*;
-
-    let time_col = data.time_col();
-    let mut cols: Vec<Expr> = vec![col(time_col)];
-    for &ch_idx in ch_indices {
-        if let Some(name) = data.data_cols().get(ch_idx) {
-            cols.push(col(name));
-        }
-    }
-
-    let df = data
-        .df()
-        .clone()
-        .lazy()
-        .filter(
-            col(time_col)
-                .gt_eq(lit(vis_x_min))
-                .and(col(time_col).lt_eq(lit(vis_x_max))),
-        )
-        .select(cols)
-        .sort(
-            [time_col],
-            SortMultipleOptions::default().with_maintain_order(true),
-        )
-        .collect()
-        .map_err(|e| format!("Export query error: {e}"))?;
+    use std::io::Write;
 
     let mut file = std::fs::File::create(path).map_err(|e| format!("File create error: {e}"))?;
-    CsvWriter::new(&mut file)
-        .include_header(true)
-        .finish(&mut df.clone())
-        .map_err(|e| format!("CSV write error: {e}"))?;
+
+    // Write header
+    write!(file, "{}", data.time_col()).map_err(|e| format!("Write error: {e}"))?;
+    for &ch_idx in ch_indices {
+        if let Some(name) = data.data_cols().get(ch_idx) {
+            write!(file, ",{}", name).map_err(|e| format!("Write error: {e}"))?;
+        }
+    }
+    writeln!(file).map_err(|e| format!("Write error: {e}"))?;
+
+    // Fetch raw points for each channel
+    let max_points = 10_000_000;
+    let mut all_points: Vec<Vec<[f64; 2]>> = Vec::new();
+    for &ch_idx in ch_indices {
+        let pts = data.get_raw_points(ch_idx, vis_x_min, vis_x_max, max_points);
+        all_points.push(pts);
+    }
+
+    if all_points.is_empty() || all_points[0].is_empty() {
+        return Ok(());
+    }
+
+    // Write rows (use first channel's timestamps)
+    let n_rows = all_points.iter().map(|p| p.len()).min().unwrap_or(0);
+    for i in 0..n_rows {
+        write!(file, "{:.15e}", all_points[0][i][0])
+            .map_err(|e| format!("Write error: {e}"))?;
+        for ch_pts in &all_points {
+            write!(file, ",{:.15e}", ch_pts[i][1])
+                .map_err(|e| format!("Write error: {e}"))?;
+        }
+        writeln!(file).map_err(|e| format!("Write error: {e}"))?;
+    }
 
     Ok(())
 }

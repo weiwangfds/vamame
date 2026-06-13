@@ -1,10 +1,8 @@
 //! Math channel definitions and computation.
 //!
 //! Math channels are virtual channels derived from one or two real channels
-//! using arithmetic operations. Binary ops use Polars lazy; unary ops compute
-//! from raw points in Rust for maximum API compatibility.
-
-use polars::prelude::*;
+//! using arithmetic operations. All operations work on raw points fetched
+//! from the data layer.
 
 use crate::data::WaveformData;
 
@@ -99,7 +97,7 @@ impl MathChannelDef {
     /// Compute the math channel data for the visible x-range.
     pub fn compute(
         &self,
-        data: &WaveformData,
+        data: &mut WaveformData,
         vis_x_min: f64,
         vis_x_max: f64,
         max_points: usize,
@@ -111,66 +109,45 @@ impl MathChannelDef {
         }
     }
 
-    /// Binary operations via Polars lazy.
+    /// Binary operations: fetch raw points from both channels, align by index.
     fn compute_binary(
         &self,
-        data: &WaveformData,
+        data: &mut WaveformData,
         vis_x_min: f64,
         vis_x_max: f64,
         max_points: usize,
     ) -> Vec<[f64; 2]> {
-        let time_col = data.time_col();
-        let data_cols = data.data_cols();
+        let pts_a = data.get_raw_points(self.source_a, vis_x_min, vis_x_max, max_points);
+        let pts_b = data.get_raw_points(self.source_b.unwrap_or(0), vis_x_min, vis_x_max, max_points);
 
-        let col_a = match data_cols.get(self.source_a) {
-            Some(c) => c.clone(),
-            None => return Vec::new(),
-        };
-        let col_b = match data_cols.get(self.source_b.unwrap_or(0)) {
-            Some(c) => c.clone(),
-            None => return Vec::new(),
-        };
+        if pts_a.is_empty() || pts_b.is_empty() {
+            return Vec::new();
+        }
 
-        let result_expr = match self.operation {
-            MathOp::Add => col(&col_a) + col(&col_b),
-            MathOp::Subtract => col(&col_a) - col(&col_b),
-            MathOp::Multiply => col(&col_a) * col(&col_b),
-            _ => return Vec::new(),
-        };
+        // Use the shorter length to avoid out-of-bounds
+        let n = pts_a.len().min(pts_b.len());
+        let mut out = Vec::with_capacity(n);
 
-        let alias = "math_result";
-        let result = data
-            .df()
-            .clone()
-            .lazy()
-            .filter(
-                col(time_col)
-                    .gt_eq(lit(vis_x_min))
-                    .and(col(time_col).lt_eq(lit(vis_x_max))),
-            )
-            .select([col(time_col), result_expr.alias(alias)])
-            .sort(
-                [time_col],
-                SortMultipleOptions::default().with_maintain_order(true),
-            )
-            .collect();
+        for i in 0..n {
+            let t = pts_a[i][0]; // use time from channel A
+            let va = pts_a[i][1];
+            let vb = pts_b[i][1];
+            let result = match self.operation {
+                MathOp::Add => va + vb,
+                MathOp::Subtract => va - vb,
+                MathOp::Multiply => va * vb,
+                _ => unreachable!(),
+            };
+            out.push([t, result]);
+        }
 
-        let df = match result {
-            Ok(df) => df,
-            Err(e) => {
-                eprintln!("Math binary error: {e}");
-                return Vec::new();
-            }
-        };
-
-        let df = subsample_if_needed(df, max_points);
-        extract_points(&df, time_col, alias)
+        out
     }
 
-    /// Unary operations from raw points (avoids Polars feature-flag issues).
+    /// Unary operations from raw points.
     fn compute_unary(
         &self,
-        data: &WaveformData,
+        data: &mut WaveformData,
         vis_x_min: f64,
         vis_x_max: f64,
         max_points: usize,
@@ -211,45 +188,4 @@ impl MathChannelDef {
             _ => pts,
         }
     }
-}
-
-/// Subsample a DataFrame if it has more rows than `max_points`.
-fn subsample_if_needed(df: DataFrame, max_points: usize) -> DataFrame {
-    if df.height() <= max_points {
-        return df;
-    }
-    let step = (df.height() / max_points).max(1);
-    let cols: Vec<Column> = df
-        .get_columns()
-        .iter()
-        .map(|c| c.gather_every(step, 0))
-        .collect();
-    DataFrame::new(cols).unwrap_or(df)
-}
-
-/// Extract `[x, y]` points from a two-column DataFrame.
-fn extract_points(df: &DataFrame, time_col: &str, data_col: &str) -> Vec<[f64; 2]> {
-    let x_ca: &Float64Chunked = match df.column(time_col) {
-        Ok(c) => match c.f64() {
-            Ok(ca) => ca,
-            Err(_) => return Vec::new(),
-        },
-        _ => return Vec::new(),
-    };
-    let y_ca: &Float64Chunked = match df.column(data_col) {
-        Ok(c) => match c.f64() {
-            Ok(ca) => ca,
-            Err(_) => return Vec::new(),
-        },
-        _ => return Vec::new(),
-    };
-
-    let n = df.height();
-    let mut points = Vec::with_capacity(n);
-    for i in 0..n {
-        if let (Some(x), Some(y)) = (x_ca.get(i), y_ca.get(i)) {
-            points.push([x, y]);
-        }
-    }
-    points
 }

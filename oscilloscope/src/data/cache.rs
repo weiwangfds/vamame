@@ -1,25 +1,23 @@
-//! CSV → Parquet cache layer.
+//! CSV → TSZ cache layer.
 //!
-//! On first open, the CSV is converted to a compressed Parquet file
-//! stored next to the original (`<name>.oscv/<stem>/data.parquet`).
+//! On first open, the CSV is converted to Gorilla-compressed TSZ files
+//! stored next to the original (`<name>.oscv/<stem>/chunks/chunk_NNNNNN/chM.tsz`).
 //!
-//! Conversion strategy:
-//! 1. Read CSV with all columns as **String** (avoids parse errors from whitespace)
-//! 2. In the lazy frame: `strip_chars` → `cast(Float64)` for every column
-//! 3. Stream to Parquet via `sink_parquet` (bounded memory)
-//!
-//! Parquet's row-group statistics enable predicate pushdown so that
-//! `scan_parquet` with a time filter reads only the relevant row groups.
+//! Conversion strategy (direct pipeline, no dependencies):
+//! 1. Read CSV with the `csv` crate (fast, zero-copy)
+//! 2. Parse each field directly to f64 with whitespace trimming
+//! 3. Accumulate rows in chunks of ROWS_PER_GROUP
+//! 4. For each chunk, encode each channel as a Gorilla (timestamp, value) stream
+//! 5. Track min/max of time column during streaming (no second pass)
 
-use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Name of the cache directory placed next to the source CSV.
 const CACHE_DIR: &str = ".oscv";
 
-/// Rows per Parquet row-group.
-const ROWS_PER_GROUP: usize = 100_000;
+/// Rows per TSZ chunk.
+pub const ROWS_PER_GROUP: usize = 100_000;
 
 // ─── Metadata ────────────────────────────────────────────────────────
 
@@ -31,6 +29,25 @@ pub struct CacheMeta {
     pub columns: Vec<String>,
     pub x_min: f64,
     pub x_max: f64,
+    #[serde(default)]
+    pub chunked: bool,
+    #[serde(default)]
+    pub n_chunks: u32,
+    #[serde(default)]
+    pub rows_per_chunk: u64,
+    /// Cache format: "parquet" (legacy) or "tsz" (Gorilla).
+    #[serde(default = "default_format")]
+    pub format: String,
+}
+
+fn default_format() -> String {
+    "parquet".to_owned()
+}
+
+impl CacheMeta {
+    pub fn n_channels(&self) -> usize {
+        if self.n_cols > 1 { self.n_cols - 1 } else { 1 }
+    }
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────
@@ -48,12 +65,26 @@ pub fn cache_dir(csv_path: &Path) -> PathBuf {
         .join(stem.as_ref())
 }
 
-pub fn parquet_path(csv_path: &Path) -> PathBuf {
-    cache_dir(csv_path).join("data.parquet")
-}
-
 pub fn meta_path(csv_path: &Path) -> PathBuf {
     cache_dir(csv_path).join("metadata.json")
+}
+
+pub fn chunks_dir(csv_path: &Path) -> PathBuf {
+    cache_dir(csv_path).join("chunks")
+}
+
+/// Path to a specific chunk directory containing .tsz files.
+pub fn chunk_dir(csv_path: &Path, chunk_idx: u32) -> PathBuf {
+    chunks_dir(csv_path).join(format!("chunk_{:06}", chunk_idx))
+}
+
+/// Path to a channel's .tsz file within a chunk directory.
+pub fn tsz_channel_path(csv_path: &Path, chunk_idx: u32, channel_idx: usize) -> PathBuf {
+    chunk_dir(csv_path, chunk_idx).join(format!("ch{}.tsz", channel_idx))
+}
+
+pub fn index_path(csv_path: &Path) -> PathBuf {
+    cache_dir(csv_path).join("index.bin")
 }
 
 // ─── Fast fingerprint ────────────────────────────────────────────────
@@ -95,20 +126,21 @@ pub fn load_meta(csv_path: &Path) -> Option<CacheMeta> {
     if fp != meta.md5 {
         return None;
     }
-    if !parquet_path(csv_path).exists() {
-        return None;
+    if meta.chunked {
+        if !index_path(csv_path).exists() || !chunks_dir(csv_path).exists() {
+            return None;
+        }
     }
     Some(meta)
 }
 
-// ─── Conversion ──────────────────────────────────────────────────────
+// ─── TSZ Conversion ──────────────────────────────────────────────────
 
-/// Convert a CSV file to cached Parquet.
+/// Convert a CSV file to chunked TSZ files with a binary index.
 ///
-/// Reads all columns as String (safe for whitespace-padded / malformed values),
-/// then in the lazy frame strips leading/trailing whitespace and casts to Float64.
-/// Uses `sink_parquet` for streaming write with bounded memory.
-pub fn convert_csv_to_parquet(
+/// Each chunk is a directory containing one `.tsz` file per channel.
+/// Each `.tsz` file is a Gorilla-compressed (timestamp, value) stream.
+pub fn convert_csv_to_tsz(
     csv_path: &Path,
     progress: &dyn Fn(usize, u64, u64),
 ) -> Result<CacheMeta, String> {
@@ -120,115 +152,202 @@ pub fn convert_csv_to_parquet(
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
 
+    let cdir = chunks_dir(csv_path);
+    std::fs::create_dir_all(&cdir)
+        .map_err(|e| format!("Cannot create {}: {e}", cdir.display()))?;
+
     progress(0, 0, total_size);
 
-    // ── Step 1: detect column count from first line ──
+    // Step 1: detect column count from first line
     let n_cols = count_csv_columns(csv_path)?;
+    let col_names: Vec<String> = (0..n_cols).map(|i| format!("column_{}", i + 1)).collect();
 
-    // ── Step 2: read CSV with all columns as String ──
-    // This avoids any parse errors from whitespace-padded values.
-    let fields: Vec<Field> = (1..=n_cols)
-        .map(|i| Field::new(PlSmallStr::from(format!("column_{i}")), DataType::String))
-        .collect();
-    let schema_override = Arc::new(Schema::from_iter(fields));
+    // Step 2: open CSV reader with whitespace trimming
+    let file = std::fs::File::open(csv_path)
+        .map_err(|e| format!("Cannot open {}: {e}", csv_path.display()))?;
+    let buf_reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
+    let (mut counting_reader, bytes_counter) = CountingReader::new(buf_reader);
 
-    let mut lf = LazyCsvReader::new(csv_path)
-        .with_has_header(false)
-        .with_dtype_overwrite(Some(schema_override))
-        .with_ignore_errors(true)
-        .with_truncate_ragged_lines(true)
-        .finish()
-        .map_err(|e| format!("CSV open error: {e}"))?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .trim(csv::Trim::All)
+        .from_reader(&mut counting_reader);
 
-    let schema = lf
-        .collect_schema()
-        .map_err(|e| format!("Schema error: {e}"))?;
-    let columns: Vec<String> = schema.iter_names().map(|s| s.to_string()).collect();
+    // Step 3: streaming conversion to chunked TSZ
+    let mut columns: Vec<Vec<f64>> = (0..n_cols).map(|_| Vec::with_capacity(ROWS_PER_GROUP)).collect();
+    let mut n_rows: usize = 0;
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
 
-    // ── Step 3: strip whitespace + cast to Float64 ──
-    // strip_chars(lit(NULL)) strips all whitespace characters.
-    let strip_cast: Vec<Expr> = columns
-        .iter()
-        .map(|name| {
-            col(name)
-                .str()
-                .strip_chars(Null {}.lit())
-                .cast(DataType::Float64)
-                .alias(name)
-        })
-        .collect();
-    let lf = lf.select(strip_cast);
+    let mut chunk_entries: Vec<super::chunk_store::ChunkEntry> = Vec::new();
+    let mut chunk_t_min = f64::INFINITY;
+    let mut chunk_t_max = f64::NEG_INFINITY;
+    let mut current_chunk_rows: u64 = 0;
+    let mut skipped: usize = 0;
 
-    // ── Step 4: stream to Parquet ──
-    let pp = parquet_path(csv_path);
+    let record_iter = rdr.byte_records();
+    for result in record_iter {
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => { skipped += 1; continue; }
+        };
+        if record.len() != n_cols {
+            skipped += 1;
+            continue;
+        }
 
-    let sink_options = ParquetWriteOptions {
-        compression: ParquetCompression::Zstd(None),
-        statistics: StatisticsOptions::default(),
-        row_group_size: Some(ROWS_PER_GROUP),
-        data_page_size: None,
-        maintain_order: true,
-    };
+        for (col_idx, field) in record.iter().enumerate() {
+            if col_idx >= n_cols { break; }
+            let val = if field.is_empty() {
+                f64::NAN
+            } else {
+                let s = unsafe { std::str::from_utf8_unchecked(field) };
+                fast_parse_f64(s)
+            };
+            columns[col_idx].push(val);
+        }
 
-    lf.sink_parquet(&pp, sink_options)
-        .map_err(|e| format!("Parquet write error: {e}"))?;
+        let t = *columns[0].last().unwrap();
+        if t.is_finite() {
+            if t < chunk_t_min { chunk_t_min = t; }
+            if t > chunk_t_max { chunk_t_max = t; }
+            if t < x_min { x_min = t; }
+            if t > x_max { x_max = t; }
+        }
+        current_chunk_rows += 1;
+        n_rows += 1;
 
-    progress(0, total_size, total_size);
+        // Flush when buffer is full
+        if columns[0].len() >= ROWS_PER_GROUP {
+            let idx = chunk_entries.len();
+            flush_chunk_tsz(csv_path, idx as u32, &mut columns, n_cols)?;
 
-    // ── Step 5: compute metadata from Parquet ──
-    let time_col = &columns[0];
-    let meta_df = LazyFrame::scan_parquet(&pp, ScanArgsParquet::default())
-        .map_err(|e| format!("Parquet scan error: {e}"))?
-        .select([
-            len().alias("n_rows"),
-            col(time_col).min().alias("x_min"),
-            col(time_col).max().alias("x_max"),
-        ])
-        .collect()
-        .map_err(|e| format!("Metadata scan error: {e}"))?;
+            chunk_entries.push(super::chunk_store::ChunkEntry {
+                index: idx as u32,
+                t_min: chunk_t_min,
+                t_max: chunk_t_max,
+                row_count: current_chunk_rows,
+                file_size: chunk_tsz_size(csv_path, idx as u32, n_cols),
+            });
 
-    let n_rows = meta_df
-        .column("n_rows")
-        .ok()
-        .and_then(|c| c.idx().ok())
-        .and_then(|ca| ca.get(0))
-        .unwrap_or(0) as usize;
+            chunk_t_min = f64::INFINITY;
+            chunk_t_max = f64::NEG_INFINITY;
+            current_chunk_rows = 0;
 
-    let x_min = meta_df
-        .column("x_min")
-        .ok()
-        .and_then(|c| c.f64().ok())
-        .and_then(|ca| ca.get(0))
-        .unwrap_or(0.0);
+            progress(n_rows, bytes_counter.get(), total_size);
+        }
+    }
 
-    let x_max = meta_df
-        .column("x_max")
-        .ok()
-        .and_then(|c| c.f64().ok())
-        .and_then(|ca| ca.get(0))
-        .unwrap_or(0.0);
+    // Flush remaining rows
+    if !columns[0].is_empty() {
+        let idx = chunk_entries.len();
+        flush_chunk_tsz(csv_path, idx as u32, &mut columns, n_cols)?;
 
-    // ── Step 6: save metadata ──
+        chunk_entries.push(super::chunk_store::ChunkEntry {
+            index: idx as u32,
+            t_min: chunk_t_min,
+            t_max: chunk_t_max,
+            row_count: current_chunk_rows,
+            file_size: chunk_tsz_size(csv_path, idx as u32, n_cols),
+        });
+    }
+
+    progress(n_rows, total_size, total_size);
+
+    // Step 4: save metadata + binary index
+    if n_rows == 0 {
+        return Err("CSV file has no data rows".to_owned());
+    }
+    if !x_min.is_finite() { x_min = 0.0; }
+    if !x_max.is_finite() { x_max = 0.0; }
+
+    let n_chunks = chunk_entries.len() as u32;
+
+    super::chunk_store::write_index(
+        &index_path(csv_path),
+        &chunk_entries,
+        &col_names,
+        n_rows,
+        x_min,
+        x_max,
+        ROWS_PER_GROUP as u64,
+    )?;
+
     let md5 = fingerprint(csv_path)?;
     let meta = CacheMeta {
         md5,
         n_rows,
         n_cols,
-        columns,
+        columns: col_names,
         x_min,
         x_max,
+        chunked: true,
+        n_chunks,
+        rows_per_chunk: ROWS_PER_GROUP as u64,
+        format: "tsz".to_owned(),
     };
-    let json =
-        serde_json::to_string_pretty(&meta).map_err(|e| format!("JSON error: {e}"))?;
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| format!("JSON error: {e}"))?;
     std::fs::write(meta_path(csv_path), json)
         .map_err(|e| format!("Cannot write metadata: {e}"))?;
 
+    if skipped > 0 {
+        eprintln!("Warning: skipped {skipped} malformed rows");
+    }
     eprintln!(
-        "Converted: {} rows, {} cols, range [{:.6e}, {:.6e}]",
-        n_rows, n_cols, x_min, x_max
+        "Converted: {} rows, {} cols, {} chunks, range [{:.6e}, {:.6e}]",
+        n_rows, n_cols, n_chunks, x_min, x_max
     );
 
     Ok(meta)
+}
+
+/// Flush accumulated columns as TSZ-encoded files in a chunk directory.
+fn flush_chunk_tsz(
+    csv_path: &Path,
+    chunk_idx: u32,
+    columns: &mut [Vec<f64>],
+    n_cols: usize,
+) -> Result<(), String> {
+    let cdir = chunk_dir(csv_path, chunk_idx);
+    std::fs::create_dir_all(&cdir)
+        .map_err(|e| format!("Cannot create chunk dir {}: {e}", cdir.display()))?;
+
+    // Column 0 is time. For each data channel (1..n_cols), encode (time, value) pairs.
+    let timestamps = &columns[0];
+    for ch in 0..n_cols {
+        if ch == 0 { continue; } // skip time column itself
+        let encoded = super::tsz_codec::encode_channel(timestamps, &columns[ch]);
+        let path = cdir.join(format!("ch{}.tsz", ch - 1));
+        std::fs::write(&path, &encoded)
+            .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
+    }
+
+    // Clear buffers for next chunk
+    for col in columns.iter_mut() {
+        col.clear();
+    }
+
+    Ok(())
+}
+
+/// Calculate total TSZ file size for a chunk (sum of all channel files).
+fn chunk_tsz_size(csv_path: &Path, chunk_idx: u32, n_cols: usize) -> u64 {
+    let cdir = chunk_dir(csv_path, chunk_idx);
+    let mut total = 0u64;
+    for ch in 0..n_cols {
+        if ch == 0 { continue; }
+        let path = cdir.join(format!("ch{}.tsz", ch - 1));
+        if let Ok(meta) = std::fs::metadata(&path) {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Fast f64 parser that handles common edge cases.
+#[inline]
+fn fast_parse_f64(s: &str) -> f64 {
+    s.parse::<f64>().unwrap_or(f64::NAN)
 }
 
 /// Count columns from the first non-empty line of a CSV file.
@@ -249,5 +368,27 @@ fn count_csv_columns(path: &Path) -> Result<usize, String> {
         if !trimmed.is_empty() {
             return Ok(trimmed.split(',').count());
         }
+    }
+}
+
+/// Wrapper around `Read` that tracks total bytes read via shared counter.
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> (Self, std::rc::Rc<std::cell::Cell<u64>>) {
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let reader = Self { inner, bytes_read: counter.clone() };
+        (reader, counter)
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read.set(self.bytes_read.get() + n as u64);
+        Ok(n)
     }
 }

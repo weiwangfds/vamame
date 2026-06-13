@@ -1,21 +1,25 @@
 [package]
 name = "oscilloscope"
 version = "0.2.0"
+default-run = "oscilloscope"
 edition = "2021"
-description = "Oscilloscope waveform viewer — Polars backend, zoom-aware downsample"
+description = "Oscilloscope waveform viewer — Gorilla codec, zoom-aware downsample"
 
 [dependencies]
 eframe = "0.31"
 egui = "0.31"
 egui_plot = "0.31"
 rfd = "0.15"
-polars = { version = "0.44", features = ["lazy", "csv", "round_series", "strings", "parquet", "streaming"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rustfft = "6"
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 md-5 = "0.10"
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+csv = "1"
+zstd = "0.13"
 
 [profile.release]
 opt-level = 2

@@ -81,7 +81,7 @@ impl OscilloscopeApp {
     // ── Result handlers (called from main thread via toolbar's try_recv) ──
 
     pub(crate) fn handle_export_csv_result(&mut self, path: &str) {
-        let Some(ref data) = self.data else { return };
+        let Some(ref mut data) = self.data else { return };
         let vis_x_min = self.last_bounds.min()[0];
         let vis_x_max = self.last_bounds.max()[0];
         let ch_indices: Vec<usize> = (0..data.n_channels()).collect();
