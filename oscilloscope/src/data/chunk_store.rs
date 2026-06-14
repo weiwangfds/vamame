@@ -347,21 +347,26 @@ impl ChunkStore {
         }
 
         // Estimate total overlapping rows from per-chunk row counts, then derive
-        // a stride so we keep ~max_points samples across the whole range.
+        // a stride so we keep ~max_points/2 bins (each bin → min+max = 2 pts).
         let estimated: usize = self.entries[start..end]
             .iter()
             .map(|e| e.row_count as usize)
             .sum();
-        let stride = if estimated > max_points {
-            (estimated / max_points).max(1)
+        let target_bins = (max_points / 2).max(1);
+        let stride = if estimated > target_bins {
+            (estimated / target_bins).max(1)
         } else {
             1
         };
 
-        let mut points: Vec<[f64; 2]> = Vec::with_capacity(
-            (estimated / stride).min(max_points + 1) + 1,
-        );
-        let mut global_i: usize = 0;
+        let cap = (estimated / stride).saturating_mul(2).min(max_points + 2) + 2;
+        let mut points: Vec<[f64; 2]> = Vec::with_capacity(cap);
+
+        // Min/max envelope state (persists across chunk boundaries).
+        let mut bin_count: usize = 0;
+        let mut bin_t: f64 = 0.0;
+        let mut bin_min: f64 = f64::INFINITY;
+        let mut bin_max: f64 = f64::NEG_INFINITY;
 
         for chunk_idx in start..end {
             if self.ensure_loaded(chunk_idx as u32).is_err() { continue; }
@@ -369,28 +374,38 @@ impl ChunkStore {
             let times = &chunk.columns[0];
             let values = &chunk.columns[col_idx];
 
-            if stride == 1 {
-                for i in 0..times.len() {
-                    let t = times[i];
-                    if t >= vis_x_min && t <= vis_x_max {
-                        points.push([t, values[i]]);
-                    }
+            for i in 0..times.len() {
+                let t = times[i];
+                if !(t >= vis_x_min && t <= vis_x_max) { continue; }
+                let v = values[i];
+                if bin_count == 0 {
+                    bin_t = t;
+                    bin_min = v;
+                    bin_max = v;
+                } else {
+                    if v < bin_min { bin_min = v; }
+                    if v > bin_max { bin_max = v; }
                 }
-            } else {
-                // Keep a point when its global index aligns with the stride.
-                for i in 0..times.len() {
-                    let t = times[i];
-                    if t >= vis_x_min && t <= vis_x_max {
-                        if global_i % stride == 0 {
-                            points.push([t, values[i]]);
-                        }
-                        global_i += 1;
+                bin_count += 1;
+                if stride == 1 || bin_count >= stride {
+                    points.push([bin_t, bin_min]);
+                    if bin_max > bin_min {
+                        points.push([bin_t, bin_max]);
                     }
+                    bin_count = 0;
                 }
             }
         }
 
-        // Final safety net: if the estimate was off, thin any excess uniformly.
+        // Flush remaining partial bin.
+        if bin_count > 0 {
+            points.push([bin_t, bin_min]);
+            if bin_max > bin_min {
+                points.push([bin_t, bin_max]);
+            }
+        }
+
+        // Safety net: thin any excess (rare — estimate is usually accurate).
         if points.len() > max_points {
             let step = (points.len() / max_points).max(1);
             points = points.into_iter().step_by(step).collect();
@@ -431,54 +446,75 @@ impl ChunkStore {
             return (0..channels.len()).map(|_| Vec::new()).collect();
         }
 
-        // Shared stride derived from total overlapping rows — applied across
-        // channels so each result keeps ~max_points samples.
+        // Each bin → min+max = 2 pts, so target half the budget as bins.
         let estimated: usize = self.entries[start..end]
             .iter()
             .map(|e| e.row_count as usize)
             .sum();
-        let stride = if estimated > max_points {
-            (estimated / max_points).max(1)
+        let target_bins = (max_points / 2).max(1);
+        let stride = if estimated > target_bins {
+            (estimated / target_bins).max(1)
         } else {
             1
         };
 
-        let cap = (estimated / stride).min(max_points + 1) + 1;
+        let cap = (estimated / stride).saturating_mul(2).min(max_points + 2) + 2;
         let mut results: Vec<Vec<[f64; 2]>> =
             (0..channels.len()).map(|_| Vec::with_capacity(cap)).collect();
-        let mut global_i: usize = 0;
+
+        let nch = channels.len();
+        let mut bin_count: usize = 0;
+        let mut bin_t: f64 = 0.0;
+        let mut bin_min: Vec<f64> = vec![f64::INFINITY; nch];
+        let mut bin_max: Vec<f64> = vec![f64::NEG_INFINITY; nch];
 
         for chunk_idx in start..end {
             if self.ensure_loaded(chunk_idx as u32).is_err() { continue; }
             let chunk = &self.cache[&(chunk_idx as u32)];
             let times = &chunk.columns[0];
 
-            if stride == 1 {
-                for i in 0..times.len() {
-                    let t = times[i];
-                    if t >= vis_x_min && t <= vis_x_max {
-                        for (out, &col_idx) in results.iter_mut().zip(&col_idxs) {
-                            out.push([t, chunk.columns[col_idx][i]]);
-                        }
+            for i in 0..times.len() {
+                let t = times[i];
+                if !(t >= vis_x_min && t <= vis_x_max) { continue; }
+
+                if bin_count == 0 {
+                    bin_t = t;
+                    for (j, &col_idx) in col_idxs.iter().enumerate() {
+                        let v = chunk.columns[col_idx][i];
+                        bin_min[j] = v;
+                        bin_max[j] = v;
+                    }
+                } else {
+                    for (j, &col_idx) in col_idxs.iter().enumerate() {
+                        let v = chunk.columns[col_idx][i];
+                        if v < bin_min[j] { bin_min[j] = v; }
+                        if v > bin_max[j] { bin_max[j] = v; }
                     }
                 }
-            } else {
-                let keep = global_i % stride == 0;
-                for i in 0..times.len() {
-                    let t = times[i];
-                    if t >= vis_x_min && t <= vis_x_max {
-                        if keep {
-                            for (out, &col_idx) in results.iter_mut().zip(&col_idxs) {
-                                out.push([t, chunk.columns[col_idx][i]]);
-                            }
+                bin_count += 1;
+
+                if stride == 1 || bin_count >= stride {
+                    for (j, out) in results.iter_mut().enumerate() {
+                        out.push([bin_t, bin_min[j]]);
+                        if bin_max[j] > bin_min[j] {
+                            out.push([bin_t, bin_max[j]]);
                         }
-                        global_i += 1;
                     }
+                    bin_count = 0;
                 }
             }
         }
 
-        // Final safety net: thin any per-channel overflow uniformly.
+        // Flush remaining partial bin.
+        if bin_count > 0 {
+            for (j, out) in results.iter_mut().enumerate() {
+                out.push([bin_t, bin_min[j]]);
+                if bin_max[j] > bin_min[j] {
+                    out.push([bin_t, bin_max[j]]);
+                }
+            }
+        }
+
         for points in results.iter_mut() {
             if points.len() > max_points {
                 let step = (points.len() / max_points).max(1);
@@ -574,7 +610,8 @@ impl ChunkStore {
 /// thread continues to use the main `ChunkStore` for other queries.
 ///
 /// `channels[i]` maps to `results[i]`. Each result is bounded by `max_points`
-/// via the same stride sampling as `ChunkStore::get_raw_points_multi`.
+/// via min/max envelope downsampling (same algorithm as
+/// `ChunkStore::get_raw_points_multi`).
 pub fn read_raw_points_multi_readonly(
     chunks_dir: &Path,
     entries: &[ChunkEntry],
@@ -600,8 +637,10 @@ pub fn read_raw_points_multi_readonly(
         .iter()
         .map(|e| e.row_count as usize)
         .sum();
-    let stride = if estimated > max_points {
-        (estimated / max_points).max(1)
+    // Each bin → min+max = 2 pts, so target half the budget as bins.
+    let target_bins = (max_points / 2).max(1);
+    let stride = if estimated > target_bins {
+        (estimated / target_bins).max(1)
     } else {
         1
     };
@@ -633,42 +672,62 @@ pub fn read_raw_points_multi_readonly(
         })
         .collect();
 
-    // Phase 2: Sequential stride sampling. Must stay sequential because the
-    // `keep` flag depends on a running global index across chunks.
-    let cap = (estimated / stride).min(max_points + 1) + 1;
+    // Phase 2: Sequential min/max envelope. Bin state persists across chunks.
+    let cap = (estimated / stride).saturating_mul(2).min(max_points + 2) + 2;
     let mut results: Vec<Vec<[f64; 2]>> =
         (0..channels.len()).map(|_| Vec::with_capacity(cap)).collect();
-    let mut global_i: usize = 0;
+
+    let nch = channels.len();
+    let mut bin_count: usize = 0;
+    let mut bin_t: f64 = 0.0;
+    let mut bin_min: Vec<f64> = vec![f64::INFINITY; nch];
+    let mut bin_max: Vec<f64> = vec![f64::NEG_INFINITY; nch];
 
     for chunk in chunk_data {
         let Some((ts_vec, col_vecs)) = chunk else { continue; };
 
-        if stride == 1 {
-            for i in 0..ts_vec.len() {
-                let t = ts_vec[i];
-                if t >= vis_x_min && t <= vis_x_max {
-                    for (out, vals) in results.iter_mut().zip(&col_vecs) {
-                        out.push([t, vals.get(i).copied().unwrap_or(f64::NAN)]);
-                    }
+        for i in 0..ts_vec.len() {
+            let t = ts_vec[i];
+            if !(t >= vis_x_min && t <= vis_x_max) { continue; }
+
+            if bin_count == 0 {
+                bin_t = t;
+                for (j, vals) in col_vecs.iter().enumerate() {
+                    let v = vals.get(i).copied().unwrap_or(f64::NAN);
+                    bin_min[j] = v;
+                    bin_max[j] = v;
+                }
+            } else {
+                for (j, vals) in col_vecs.iter().enumerate() {
+                    let v = vals.get(i).copied().unwrap_or(f64::NAN);
+                    if v < bin_min[j] { bin_min[j] = v; }
+                    if v > bin_max[j] { bin_max[j] = v; }
                 }
             }
-        } else {
-            let keep = global_i % stride == 0;
-            for i in 0..ts_vec.len() {
-                let t = ts_vec[i];
-                if t >= vis_x_min && t <= vis_x_max {
-                    if keep {
-                        for (out, vals) in results.iter_mut().zip(&col_vecs) {
-                            out.push([t, vals.get(i).copied().unwrap_or(f64::NAN)]);
-                        }
+            bin_count += 1;
+
+            if stride == 1 || bin_count >= stride {
+                for (j, out) in results.iter_mut().enumerate() {
+                    out.push([bin_t, bin_min[j]]);
+                    if bin_max[j] > bin_min[j] {
+                        out.push([bin_t, bin_max[j]]);
                     }
-                    global_i += 1;
                 }
+                bin_count = 0;
             }
         }
     }
 
-    // Thin any per-channel overflow uniformly.
+    // Flush remaining partial bin.
+    if bin_count > 0 {
+        for (j, out) in results.iter_mut().enumerate() {
+            out.push([bin_t, bin_min[j]]);
+            if bin_max[j] > bin_min[j] {
+                out.push([bin_t, bin_max[j]]);
+            }
+        }
+    }
+
     for points in results.iter_mut() {
         if points.len() > max_points {
             let step = (points.len() / max_points).max(1);
