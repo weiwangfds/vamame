@@ -21,6 +21,12 @@
 //! [N bytes] zstd-compressed XOR values
 //! ```
 
+/// zstd compression level for TSZ streams.
+///
+/// Level 1 keeps encoding fast (the delta-of-delta / XOR transforms already
+/// do most of the work); decode speed is independent of the compression level.
+const ZSTD_LEVEL: i32 = 1;
+
 /// Encode a single channel's (timestamps, values) into compressed bytes.
 pub fn encode_channel(timestamps: &[f64], values: &[f64]) -> Vec<u8> {
     assert_eq!(timestamps.len(), values.len());
@@ -30,27 +36,35 @@ pub fn encode_channel(timestamps: &[f64], values: &[f64]) -> Vec<u8> {
     }
 
     // ── Encode timestamps: delta-of-delta on i64 bitcast ──
-    let ts_bits: Vec<i64> = timestamps.iter().map(|t| t.to_bits() as i64).collect();
-    let mut ts_deltas = Vec::with_capacity(n - 1);
+    // Build the delta-of-delta stream directly without materializing all bit casts.
+    let mut ts_deltas: Vec<i64> = Vec::with_capacity(n - 1);
     if n > 1 {
-        ts_deltas.push(ts_bits[1].wrapping_sub(ts_bits[0]));
+        let mut prev_bits = timestamps[0].to_bits() as i64;
+        let mut cur_bits = timestamps[1].to_bits() as i64;
+        let mut prev_delta = cur_bits.wrapping_sub(prev_bits);
+        ts_deltas.push(prev_delta);
+        prev_bits = cur_bits;
         for i in 2..n {
-            let delta = ts_bits[i].wrapping_sub(ts_bits[i - 1]);
-            let prev_delta = ts_bits[i - 1].wrapping_sub(ts_bits[i - 2]);
+            cur_bits = timestamps[i].to_bits() as i64;
+            let delta = cur_bits.wrapping_sub(prev_bits);
             ts_deltas.push(delta.wrapping_sub(prev_delta)); // delta-of-delta
+            prev_delta = delta;
+            prev_bits = cur_bits;
         }
     }
     let ts_bytes: &[u8] = bytemuck::cast_slice(&ts_deltas);
-    let ts_compressed = zstd::encode_all(ts_bytes, 3).unwrap_or_default();
+    let ts_compressed = zstd::encode_all(ts_bytes, ZSTD_LEVEL).unwrap_or_default();
 
     // ── Encode values: XOR of consecutive u64 bit patterns ──
-    let val_bits: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
-    let mut val_xor = Vec::with_capacity(n - 1);
-    for i in 1..n {
-        val_xor.push(val_bits[i] ^ val_bits[i - 1]);
+    let mut val_xor: Vec<u64> = Vec::with_capacity(n - 1);
+    let mut prev = values[0].to_bits();
+    for &v in &values[1..] {
+        let bits = v.to_bits();
+        val_xor.push(bits ^ prev);
+        prev = bits;
     }
     let val_bytes: &[u8] = bytemuck::cast_slice(&val_xor);
-    let val_compressed = zstd::encode_all(val_bytes, 3).unwrap_or_default();
+    let val_compressed = zstd::encode_all(val_bytes, ZSTD_LEVEL).unwrap_or_default();
 
     // ── Pack into binary format ──
     let mut out = Vec::with_capacity(28 + ts_compressed.len() + val_compressed.len());
@@ -143,12 +157,6 @@ pub fn decode_channel(data: &[u8]) -> (Vec<f64>, Vec<f64>) {
     (timestamps, values)
 }
 
-/// Decode into Vec<[f64; 2]> (time, value) pairs.
-pub fn decode_channel_points(data: &[u8]) -> Vec<[f64; 2]> {
-    let (timestamps, values) = decode_channel(data);
-    timestamps.into_iter().zip(values).map(|(t, v)| [t, v]).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,19 +208,6 @@ mod tests {
             ratio
         );
         assert!(ratio > 2.0, "Expected at least 2:1 compression, got {:.1}:1", ratio);
-    }
-
-    #[test]
-    fn decode_points_matches() {
-        let timestamps = vec![1.0, 2.0, 3.0];
-        let values = vec![10.0, 20.0, 30.0];
-        let encoded = encode_channel(&timestamps, &values);
-        let points = decode_channel_points(&encoded);
-        assert_eq!(points.len(), 3);
-        assert!((points[0][0] - 1.0).abs() < f64::EPSILON);
-        assert!((points[0][1] - 10.0).abs() < f64::EPSILON);
-        assert!((points[2][0] - 3.0).abs() < f64::EPSILON);
-        assert!((points[2][1] - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
