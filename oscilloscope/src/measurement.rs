@@ -45,20 +45,45 @@ impl Default for Measurements {
     }
 }
 
-/// Maximum raw points for time-domain measurement calculations.
-const MEASUREMENT_MAX_POINTS: usize = 50_000;
-
 impl Measurements {
-    /// Compute all measurements for a channel in the visible x-range.
-    ///
-    /// Statistical measurements (vmax, vmin, vpp, vmean, vrms) are computed
-    /// directly from Parquet via fast aggregations.  Time-domain measurements
-    /// (frequency, rise time, etc.) still need raw sample points but are
-    /// limited to `MEASUREMENT_MAX_POINTS`.
-    pub fn compute(data: &WaveformData, ch_idx: usize, vis_x_min: f64, vis_x_max: f64) -> Self {
+    /// Compute **only** the statistical measurements (vmin/vmax/vpp/vmean/vrms)
+    /// using the precomputed per-chunk stats — no TSZ decoding at all. Used in
+    /// density mode where time-domain measurements (freq/rise/fall) are too
+    /// expensive to recompute every frame on pan/zoom.
+    pub fn compute_stats_only(
+        data: &mut WaveformData,
+        ch_idx: usize,
+        vis_x_min: f64,
+        vis_x_max: f64,
+    ) -> Self {
+        let mut m = Self::default();
+        if let Some((vmin, vmax, vmean, vrms, n)) =
+            data.compute_channel_stats(ch_idx, vis_x_min, vis_x_max)
+        {
+            if n >= 2 {
+                m.vmin = vmin;
+                m.vmax = vmax;
+                m.vpp = vmax - vmin;
+                m.vmean = vmean;
+                m.vrms = vrms;
+            }
+        }
+        m
+    }
+
+    /// Build measurements from already-decoded (cached) points, with voltage
+    /// stats taken from precomputed aggregations. This avoids any TSZ decode —
+    /// the time-domain part reuses the line-cache points.
+    pub fn compute_from_cached(
+        data: &mut WaveformData,
+        ch_idx: usize,
+        vis_x_min: f64,
+        vis_x_max: f64,
+        points: &[[f64; 2]],
+    ) -> Self {
         let mut m = Self::default();
 
-        // --- Statistical measurements via Parquet aggregation (fast path) ---
+        // Voltage stats: precomputed (zero decode).
         if let Some((vmin, vmax, vmean, vrms, n)) =
             data.compute_channel_stats(ch_idx, vis_x_min, vis_x_max)
         {
@@ -71,35 +96,17 @@ impl Measurements {
             }
         }
 
-        // --- Time-domain measurements from raw points (limited) ---
-        let points = data.get_raw_points(ch_idx, vis_x_min, vis_x_max, MEASUREMENT_MAX_POINTS);
-        if points.len() < 4 {
-            // Fill stats from raw points if aggregation failed
-            if m.vpp.is_nan() && points.len() >= 2 {
-                let y_vals: Vec<f64> = points.iter().map(|p| p[1]).collect();
-                let vmax = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let vmin = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
-                let sum: f64 = y_vals.iter().sum();
-                let sum_sq: f64 = y_vals.iter().map(|v| v * v).sum();
-                let n = y_vals.len() as f64;
-                m.vmax = vmax;
-                m.vmin = vmin;
-                m.vpp = vmax - vmin;
-                m.vmean = sum / n;
-                m.vrms = (sum_sq / n).sqrt();
-            }
-            return m;
+        // Time-domain: from the cached points (no extra decode).
+        if points.len() >= 4 {
+            let td = compute_time_domain(points);
+            m.frequency = td.frequency;
+            m.period = td.period;
+            m.rise_time = td.rise_time;
+            m.fall_time = td.fall_time;
+            m.duty_cycle = td.duty_cycle;
+            m.pos_width = td.pos_width;
+            m.neg_width = td.neg_width;
         }
-
-        let td = compute_time_domain(&points);
-        m.frequency = td.frequency;
-        m.period = td.period;
-        m.rise_time = td.rise_time;
-        m.fall_time = td.fall_time;
-        m.duty_cycle = td.duty_cycle;
-        m.pos_width = td.pos_width;
-        m.neg_width = td.neg_width;
-
         m
     }
 
