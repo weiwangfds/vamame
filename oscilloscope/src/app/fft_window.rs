@@ -130,7 +130,7 @@ impl OscilloscopeApp {
                     .height(ui.available_height() - 10.0)
                     .show(ui, |plot_ui| {
                         if !spectrum.is_empty() {
-                            let line = Line::new(PlotPoints::from(spectrum))
+                            let line = Line::new("FFT", PlotPoints::from(spectrum))
                                 .color(Color32::from_rgb(0, 200, 255))
                                 .width(1.5);
                             plot_ui.line(line);

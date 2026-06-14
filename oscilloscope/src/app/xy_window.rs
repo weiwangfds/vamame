@@ -91,7 +91,7 @@ impl OscilloscopeApp {
                     .height(ui.available_height() - 10.0)
                     .show(ui, |plot_ui| {
                         if !xy_points.is_empty() {
-                            let line = Line::new(PlotPoints::from(xy_points))
+                            let line = Line::new("XY", PlotPoints::from(xy_points))
                                 .color(Color32::from_rgb(0, 255, 100))
                                 .width(1.0);
                             plot_ui.line(line);

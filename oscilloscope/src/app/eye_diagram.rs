@@ -193,6 +193,7 @@ impl EyeDiagramState {
 
         egui::ColorImage {
             size: [gx, gy],
+            source_size: egui::Vec2::new(gx as f32, gy as f32),
             pixels: row_pixels,
         }
     }
@@ -696,6 +697,7 @@ impl OscilloscopeApp {
 
                             if let Some(ref texture) = state.texture {
                                 let img = PlotImage::new(
+                                    "eye_diagram",
                                     texture,
                                     PlotPoint::new(n_ui_f / 2.0, (y_min + y_max) / 2.0),
                                     Vec2::new(
