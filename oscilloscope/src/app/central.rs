@@ -194,66 +194,11 @@ impl OscilloscopeApp {
                                         });
                                 }
 
-                                // -- remove from strip --
-                                if ui
-                                    .button(RichText::new("×").small())
-                                    .on_hover_text("Remove from strip")
-                                    .clicked()
-                                {
-                                    channel_to_remove = Some(ch_idx);
-                                }
-
                                 ui.separator();
-                            }
-
-                            // -- "+" overlay button --
-                            let available_chs: Vec<(usize, String, Color32)> = (0
-                                ..self.channels.len())
-                                .filter(|i| !strip_chs.contains(i))
-                                .map(|i| {
-                                    (
-                                        i,
-                                        self.channels[i].name.clone(),
-                                        self.channels[i].color,
-                                    )
-                                })
-                                .collect();
-
-                            if !available_chs.is_empty() {
-                                ui.menu_button(RichText::new("+ Overlay").small(), |ui| {
-                                    for (ch_idx, name, color) in &available_chs {
-                                        if ui
-                                            .button(
-                                                RichText::new(format!("  {}  +", name))
-                                                    .color(*color),
-                                            )
-                                            .clicked()
-                                        {
-                                            channel_to_add = Some(*ch_idx);
-                                        }
-                                    }
-                                });
-                            }
-
-                            // -- split --
-                            if strip_chs.len() > 1 {
-                                if ui.button("Split").clicked() {
-                                    split_requested = true;
-                                }
-                            }
-                        });
-
-                        // ======== threshold / binarize controls (second row) ========
-                        ui.horizontal_wrapped(|ui| {
-                            for &ch_idx in &strip_chs {
-                                if ch_idx >= self.channels.len() {
-                                    continue;
-                                }
-                                let ch_color = self.channels[ch_idx].color;
 
                                 // -- threshold value input with unit selector --
                                 ui.label(
-                                    RichText::new(format!("{} Vth:", self.channels[ch_idx].name))
+                                    RichText::new("Vth:")
                                         .small()
                                         .color(ch_color),
                                 );
@@ -340,15 +285,59 @@ impl OscilloscopeApp {
                                     }
                                 }
 
+                                // -- remove from strip --
+                                if ui
+                                    .button(RichText::new("×").small())
+                                    .on_hover_text("Remove from strip")
+                                    .clicked()
+                                {
+                                    channel_to_remove = Some(ch_idx);
+                                }
+
                                 ui.separator();
                             }
-                        });
 
-                        // ======== Y-axis controls (third row) ========
-                        ui.horizontal_wrapped(|ui| {
+                            // -- "+" overlay button --
+                            let available_chs: Vec<(usize, String, Color32)> = (0
+                                ..self.channels.len())
+                                .filter(|i| !strip_chs.contains(i))
+                                .map(|i| {
+                                    (
+                                        i,
+                                        self.channels[i].name.clone(),
+                                        self.channels[i].color,
+                                    )
+                                })
+                                .collect();
+
+                            if !available_chs.is_empty() {
+                                ui.menu_button(RichText::new("+ Overlay").small(), |ui| {
+                                    for (ch_idx, name, color) in &available_chs {
+                                        if ui
+                                            .button(
+                                                RichText::new(format!("  {}  +", name))
+                                                    .color(*color),
+                                            )
+                                            .clicked()
+                                        {
+                                            channel_to_add = Some(*ch_idx);
+                                        }
+                                    }
+                                });
+                            }
+
+                            // -- split --
+                            if strip_chs.len() > 1 {
+                                if ui.button("Split").clicked() {
+                                    split_requested = true;
+                                }
+                            }
+
+                            ui.separator();
+
+                            // -- Y-axis controls --
                             let y_mode = self.strips[s_idx].y_mode;
 
-                            // -- Linked button --
                             let linked_color = if y_mode == YAxisMode::Linked {
                                 Color32::from_rgb(100, 180, 255)
                             } else {
@@ -362,7 +351,6 @@ impl OscilloscopeApp {
                                 self.strips[s_idx].y_mode = YAxisMode::Linked;
                             }
 
-                            // -- Auto button --
                             let auto_color = if y_mode == YAxisMode::Auto {
                                 Color32::from_rgb(0, 200, 100)
                             } else {
@@ -376,7 +364,6 @@ impl OscilloscopeApp {
                                 self.strips[s_idx].y_mode = YAxisMode::Auto;
                             }
 
-                            // -- Manual button --
                             let manual_color = if y_mode == YAxisMode::Manual {
                                 Color32::from_rgb(255, 200, 80)
                             } else {
@@ -390,7 +377,6 @@ impl OscilloscopeApp {
                                 self.strips[s_idx].y_mode = YAxisMode::Manual;
                             }
 
-                            // -- Min/Max inputs for Manual mode --
                             if y_mode == YAxisMode::Manual {
                                 ui.label(RichText::new("min:").small().color(Color32::GRAY));
                                 ui.add(
@@ -406,7 +392,6 @@ impl OscilloscopeApp {
                                 );
                             }
 
-                            // -- Offset display for Linked mode --
                             if y_mode == YAxisMode::Linked {
                                 ui.label(RichText::new("offset:").small().color(Color32::GRAY));
                                 ui.add(
@@ -418,10 +403,17 @@ impl OscilloscopeApp {
                             }
                         });
 
-                        // ======== ensure cache ========
+                        // ======== ensure cache for math channels ========
+                        // Real channels are pre-warmed above via the background
+                        // ensure_cache_async; only math channels (derived from
+                        // others) still need the synchronous path here.
                         let strip_chs = self.strips[s_idx].channel_indices.clone();
                         for &ch_idx in &strip_chs {
-                            self.ensure_cache(ch_idx);
+                            if let Some(ref data) = self.data {
+                                if ch_idx >= data.n_channels() {
+                                    self.ensure_cache(ch_idx);
+                                }
+                            }
                         }
 
                         // ======== plot ========
@@ -491,7 +483,16 @@ impl OscilloscopeApp {
 
                             let plot_response = plot.show(ui, |plot_ui| {
                                 if initial_fit {
-                                    plot_ui.set_auto_bounds(Vec2b::new(true, true));
+                                    // Auto-fit Y to the data, but keep the X
+                                    // range set at load time (which may be a
+                                    // sub-window for very large files).
+                                    plot_ui.set_auto_bounds(Vec2b::new(false, true));
+                                    plot_ui.set_plot_bounds(
+                                        egui_plot::PlotBounds::from_min_max(
+                                            [self.last_bounds.min()[0], -1.0],
+                                            [self.last_bounds.max()[0], 1.0],
+                                        ),
+                                    );
                                 } else if undo_zoom {
                                     plot_ui.set_plot_bounds(undo_bounds);
                                 } else if all_binarize_hide {
@@ -523,12 +524,13 @@ impl OscilloscopeApp {
                                     {
                                         continue;
                                     }
-                                    if let Some(ref cached) = self.cache[ch_idx] {
-                                        let ch = &self.channels[ch_idx];
+                                    let ch = &self.channels[ch_idx];
 
-                                        // Draw original analog waveform (unless hidden by binarize)
-                                        let hide_original = ch.binarize_enabled && ch.binarize_hide_original;
-                                        if !hide_original {
+                                    // Draw original analog waveform (unless hidden by binarize)
+                                    let hide_original = ch.binarize_enabled && ch.binarize_hide_original;
+                                    if !hide_original {
+                                        // Line mode: egui_plot::Line (GPU-rasterized)
+                                        if let Some(ref cached) = self.cache[ch_idx] {
                                             let line =
                                                 Line::new(PlotPoints::from(cached.points.clone()))
                                                     .color(ch.color)
@@ -536,30 +538,32 @@ impl OscilloscopeApp {
                                                     .name(&ch.name);
                                             plot_ui.line(line);
                                         }
+                                    }
 
-                                        // --- Threshold reference line (red dashed) ---
-                                        if ch.threshold_enabled || ch.binarize_enabled {
-                                            let bounds = plot_ui.plot_bounds();
-                                            let x_min = bounds.min()[0];
-                                            let x_max = bounds.max()[0];
-                                            let thresh = ch.threshold_value;
-                                            plot_ui.line(
-                                                Line::new(PlotPoints::from(vec![
-                                                    [x_min, thresh],
-                                                    [x_max, thresh],
-                                                ]))
-                                                .color(
-                                                    Color32::from_rgba_unmultiplied(255, 80, 80, 200),
-                                                )
-                                                .width(1.5)
-                                                .style(egui_plot::LineStyle::Dashed { length: 6.0 })
-                                                .name(&format!("{} Vth={:.3}V", ch.name, thresh)),
-                                            );
-                                        }
+                                    // --- Threshold reference line (red dashed) ---
+                                    if ch.threshold_enabled || ch.binarize_enabled {
+                                        let bounds = plot_ui.plot_bounds();
+                                        let x_min = bounds.min()[0];
+                                        let x_max = bounds.max()[0];
+                                        let thresh = ch.threshold_value;
+                                        plot_ui.line(
+                                            Line::new(PlotPoints::from(vec![
+                                                [x_min, thresh],
+                                                [x_max, thresh],
+                                            ]))
+                                            .color(
+                                                Color32::from_rgba_unmultiplied(255, 80, 80, 200),
+                                            )
+                                            .width(1.5)
+                                            .style(egui_plot::LineStyle::Dashed { length: 6.0 })
+                                            .name(&format!("{} Vth={:.3}V", ch.name, thresh)),
+                                        );
+                                    }
 
-                                        // --- Binarized square wave ---
-                                        if ch.binarize_enabled {
-                                            let thresh = ch.threshold_value;
+                                    // --- Binarized square wave ---
+                                    if ch.binarize_enabled {
+                                        let thresh = ch.threshold_value;
+                                        if let Some(ref cached) = self.cache[ch_idx] {
                                             let bin_points =
                                                 generate_binarized_points(&cached.points, thresh);
                                             if !bin_points.is_empty() {
