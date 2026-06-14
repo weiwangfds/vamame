@@ -7,7 +7,7 @@ use super::{OscilloscopeApp, MAX_DISPLAY_POINTS};
 
 impl OscilloscopeApp {
     pub(crate) fn draw_xy_window(&mut self, ctx: &egui::Context) {
-        let Some(ref data) = self.data else { return };
+        let Some(ref mut data) = self.data else { return };
 
         egui::Window::new("XY Mode (Lissajous)")
             .open(&mut self.show_xy_window)

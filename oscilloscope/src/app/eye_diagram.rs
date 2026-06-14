@@ -745,7 +745,7 @@ impl OscilloscopeApp {
         let ch = self.eye_channel;
         let points = self
             .data
-            .as_ref()
+            .as_mut()
             .map(|d| d.get_raw_points(ch, vis_x_min, vis_x_max, 200_000))
             .unwrap_or_default();
 
@@ -864,7 +864,7 @@ impl OscilloscopeApp {
 
         let points = self
             .data
-            .as_ref()
+            .as_mut()
             .map(|d| d.get_raw_points(ch_idx, vis_x_min, vis_x_max, 500_000))
             .unwrap_or_default();
 
@@ -951,7 +951,7 @@ impl OscilloscopeApp {
         // ── Fetch raw data once (500k limit) ──
         let points = self
             .data
-            .as_ref()
+            .as_mut()
             .map(|d| d.get_raw_points(ch_idx, vis_x_min, vis_x_max, 500_000))
             .unwrap_or_default();
 
@@ -1179,7 +1179,7 @@ impl OscilloscopeApp {
     /// Detects edges on the clock channel and returns indices into `signal_points`
     /// that are closest to each clock edge time.
     fn find_clock_edges(
-        &self,
+        &mut self,
         clk_idx: usize,
         vis_x_min: f64,
         vis_x_max: f64,
@@ -1187,7 +1187,7 @@ impl OscilloscopeApp {
     ) -> Vec<usize> {
         let clk_points = self
             .data
-            .as_ref()
+            .as_mut()
             .map(|d| d.get_raw_points(clk_idx, vis_x_min, vis_x_max, 200_000))
             .unwrap_or_default();
 

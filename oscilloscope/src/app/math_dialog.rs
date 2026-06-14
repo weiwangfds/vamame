@@ -227,7 +227,7 @@ impl OscilloscopeApp {
 
     /// Ensure cache for a math channel (index >= n_real_channels).
     pub(crate) fn ensure_math_cache(&mut self, ch_idx: usize) {
-        let Some(ref data) = self.data else { return };
+        let Some(ref mut data) = self.data else { return };
         let n_real = data.n_channels();
         let math_idx = ch_idx - n_real;
         if math_idx >= self.math_channels.len() {

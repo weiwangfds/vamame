@@ -9,7 +9,7 @@ use super::OscilloscopeApp;
 
 impl OscilloscopeApp {
     pub(crate) fn draw_fft_window(&mut self, ctx: &egui::Context) {
-        let Some(ref data) = self.data else { return };
+        let Some(ref mut data) = self.data else { return };
 
         egui::Window::new("FFT Spectrum Analysis")
             .open(&mut self.show_fft_window)
@@ -83,10 +83,12 @@ impl OscilloscopeApp {
                 // Compute / retrieve cached FFT
                 let vis_x_min = self.last_bounds.min()[0];
                 let vis_x_max = self.last_bounds.max()[0];
+                let span = (vis_x_max - vis_x_min).max(1e-30);
+                let tol = span * 1e-6;
                 let needs_recompute = match &self.fft_cache {
                     Some((bounds, ch, wt, sc, _)) => {
-                        (bounds.min()[0] - vis_x_min).abs() > f64::EPSILON
-                            || (bounds.max()[0] - vis_x_max).abs() > f64::EPSILON
+                        (bounds.min()[0] - vis_x_min).abs() > tol
+                            || (bounds.max()[0] - vis_x_max).abs() > tol
                             || *ch != self.fft_channel
                             || *wt != self.fft_window_type
                             || *sc != self.fft_scale
