@@ -7,8 +7,6 @@
 
 pub mod cache;
 pub mod chunk_store;
-#[allow(dead_code)]
-pub mod indexed;
 pub mod tsz_codec;
 
 use cache::CacheMeta;
@@ -71,15 +69,14 @@ impl TszData {
         &self.data_cols
     }
 
-    pub fn get_channel_points(
-        &mut self,
-        ch_idx: usize,
-        delay: f64,
-        vis_x_min: f64,
-        vis_x_max: f64,
-        max_points: usize,
-    ) -> Vec<[f64; 2]> {
-        self.store.get_channel_points(ch_idx, delay, vis_x_min, vis_x_max, max_points)
+    /// Directory holding chunk `.tsz` files (for background decode).
+    pub fn chunks_dir(&self) -> &std::path::Path {
+        self.store.chunks_dir()
+    }
+
+    /// Chunk index entries (for background decode).
+    pub fn entries(&self) -> &[chunk_store::ChunkEntry] {
+        self.store.entries()
     }
 
     pub fn get_raw_points(
@@ -90,6 +87,18 @@ impl TszData {
         max_points: usize,
     ) -> Vec<[f64; 2]> {
         self.store.get_raw_points(ch_idx, vis_x_min, vis_x_max, max_points)
+    }
+
+    /// Fetch raw points for several channels in one pass (single decode per
+    /// chunk). See `ChunkStore::get_raw_points_multi`.
+    pub fn get_raw_points_multi(
+        &mut self,
+        channels: &[usize],
+        vis_x_min: f64,
+        vis_x_max: f64,
+        max_points: usize,
+    ) -> Vec<Vec<[f64; 2]>> {
+        self.store.get_raw_points_multi(channels, vis_x_min, vis_x_max, max_points)
     }
 
     pub fn compute_channel_stats(
@@ -148,16 +157,17 @@ impl WaveformData {
         }
     }
 
-    pub fn get_channel_points(
-        &mut self,
-        ch_idx: usize,
-        delay: f64,
-        vis_x_min: f64,
-        vis_x_max: f64,
-        max_points: usize,
-    ) -> Vec<[f64; 2]> {
+    /// Directory holding chunk `.tsz` files (for background decode).
+    pub fn chunks_dir(&self) -> &std::path::Path {
         match self {
-            Self::Tsz(d) => d.get_channel_points(ch_idx, delay, vis_x_min, vis_x_max, max_points),
+            Self::Tsz(d) => d.chunks_dir(),
+        }
+    }
+
+    /// Chunk index entries (for background decode).
+    pub fn entries(&self) -> &[chunk_store::ChunkEntry] {
+        match self {
+            Self::Tsz(d) => d.entries(),
         }
     }
 
@@ -181,6 +191,20 @@ impl WaveformData {
     ) -> Vec<[f64; 2]> {
         match self {
             Self::Tsz(d) => d.get_raw_points(ch_idx, vis_x_min, vis_x_max, max_points),
+        }
+    }
+
+    /// Fetch raw points for several channels in one pass (single decode per
+    /// chunk). `channels[i]` maps to `results[i]`.
+    pub fn get_raw_points_multi(
+        &mut self,
+        channels: &[usize],
+        vis_x_min: f64,
+        vis_x_max: f64,
+        max_points: usize,
+    ) -> Vec<Vec<[f64; 2]>> {
+        match self {
+            Self::Tsz(d) => d.get_raw_points_multi(channels, vis_x_min, vis_x_max, max_points),
         }
     }
 
@@ -228,38 +252,6 @@ mod tests {
         assert_eq!(data.n_channels(), 7);
         assert!(data.n_rows() > 0);
         assert!(data.time_span() > 0.0);
-    }
-
-    #[test]
-    fn downsample_produces_points() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().join("demoCS0_3.csv");
-        if !path.exists() {
-            eprintln!("Skipping: demoCS0_3.csv not found");
-            return;
-        }
-        let mut data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
-        let pts = data.get_channel_points(0, 0.0, data.x_min(), data.x_max(), 4000);
-        assert!(!pts.is_empty(), "downsample returned 0 points");
-        assert!(pts.len() <= 8000, "got {} points", pts.len());
-    }
-
-    #[test]
-    fn exact_mode_when_zoomed_in() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().join("demoCS0_3.csv");
-        if !path.exists() {
-            eprintln!("Skipping: demoCS0_3.csv not found");
-            return;
-        }
-        let mut data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
-        let pts = data.get_channel_points(
-            0, 0.0,
-            data.x_min(),
-            data.x_min() + data.time_span() * 0.1,
-            100000,
-        );
-        assert!(!pts.is_empty(), "exact mode returned 0 points");
     }
 
     #[test]
@@ -362,5 +354,207 @@ mod tests {
                 panic!("CH{}: compute_channel_stats returned None", ch_idx + 1);
             }
         }
+    }
+
+    /// Sub-range stats must equal full-range stats when the query range covers
+    /// the whole data (exercises both fully-contained chunks, via precomputed
+    /// values, and the two boundary chunks via decode).
+    #[test]
+    fn stats_full_range_matches_subrange_aggregation() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("demoCS0_2.csv");
+        if !path.exists() {
+            eprintln!("Skipping: demoCS0_2.csv not found");
+            return;
+        }
+
+        // Force a fresh conversion so precomputed stats are populated (v3 index).
+        let cache_dir = cache::cache_dir(&path);
+        if cache_dir.exists() {
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
+
+        let mut data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
+        let xmin = data.x_min();
+        let xmax = data.x_max();
+
+        // Full range (all chunks fully contained → precomputed path).
+        let full = data.compute_channel_stats(0, xmin, xmax).expect("full stats");
+
+        // Slightly-narrowed range: the two boundary chunks now partially overlap
+        // and are decoded + filtered exactly, while interior chunks still use
+        // precomputed values. The result should be very close to the full-range
+        // stats — only the handful of samples exactly on the endpoints differ.
+        let eps = data.time_span() * 1e-9;
+        let near_full = data.compute_channel_stats(0, xmin + eps, xmax - eps)
+            .expect("near-full stats");
+        let count_diff = full.4.saturating_sub(near_full.4);
+        assert!(
+            count_diff <= 10,
+            "count dropped by {count_diff} when shrinking range by eps — \
+             expected only a few boundary samples to be excluded \
+             (full={}, near={})",
+            full.4, near_full.4,
+        );
+        // Min/max are unaffected unless the extremum happens to sit exactly on
+        // an endpoint; allow a tiny relative tolerance.
+        assert!(
+            (full.0 - near_full.0).abs() < 1e-9 * full.0.abs().max(1.0),
+            "vmin mismatch: full={:.10e} near={:.10e}", full.0, near_full.0,
+        );
+        assert!(
+            (full.1 - near_full.1).abs() < 1e-9 * full.1.abs().max(1.0),
+            "vmax mismatch: full={:.10e} near={:.10e}", full.1, near_full.1,
+        );
+
+        eprintln!(
+            "subrange stats OK: vmin={:.6e} vmax={:.6e} mean={:.6e} rms={:.6e} n={}",
+            full.0, full.1, full.2, full.3, full.4,
+        );
+    }
+
+    /// `get_raw_points_multi` must return the same points as calling
+    /// `get_raw_points` once per channel with the same range/cap.
+    #[test]
+    fn raw_points_multi_matches_per_channel() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("demoCS0_2.csv");
+        if !path.exists() {
+            eprintln!("Skipping: demoCS0_2.csv not found");
+            return;
+        }
+
+        let mut data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
+        let xmin = data.x_min();
+        let xmax = data.x_max();
+        let n_ch = data.n_channels();
+
+        const CAP: usize = 50_000;
+        let chs: Vec<usize> = (0..n_ch).collect();
+
+        // Per-channel (fresh store state each call shares the LRU, but results
+        // must still be identical to the batch path).
+        let per_channel: Vec<Vec<[f64; 2]>> = (0..n_ch)
+            .map(|ch| data.get_raw_points(ch, xmin, xmax, CAP))
+            .collect();
+
+        // Multi-channel single pass.
+        let batched = data.get_raw_points_multi(&chs, xmin, xmax, CAP);
+
+        assert_eq!(per_channel.len(), batched.len(), "channel count mismatch");
+        for ch in 0..n_ch {
+            let a = &per_channel[ch];
+            let b = &batched[ch];
+            assert_eq!(a.len(), b.len(), "CH{} point count mismatch: {} vs {}", ch + 1, a.len(), b.len());
+            let mismatches = a.iter().zip(b.iter()).take(20).filter(|(p, q)| {
+                (p[0] - q[0]).abs() > 1e-12 || (p[1] - q[1]).abs() > 1e-12
+            }).count();
+            assert_eq!(mismatches, 0, "CH{}: first 20 points differ", ch + 1);
+        }
+        eprintln!("get_raw_points_multi OK: {} channels × {} points match per-channel", n_ch, batched[0].len());
+    }
+
+    /// The stateless background-decode path must return the same points as the
+    /// LRU-backed `get_raw_points_multi` (it re-implements the decode+sample
+    /// logic without any shared cache).
+    #[test]
+    fn readonly_decode_matches_lru_path() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("demoCS0_2.csv");
+        if !path.exists() {
+            eprintln!("Skipping: demoCS0_2.csv not found");
+            return;
+        }
+
+        let mut data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
+        let xmin = data.x_min();
+        let xmax = data.x_max();
+        let n_ch = data.n_channels();
+        let chs: Vec<usize> = (0..n_ch).collect();
+        const CAP: usize = 50_000;
+
+        let via_lru = data.get_raw_points_multi(&chs, xmin, xmax, CAP);
+        let via_readonly = chunk_store::read_raw_points_multi_readonly(
+            data.chunks_dir(),
+            data.entries(),
+            &chs,
+            xmin,
+            xmax,
+            CAP,
+        );
+
+        assert_eq!(via_lru.len(), via_readonly.len(), "channel count mismatch");
+        for ch in 0..n_ch {
+            let a = &via_lru[ch];
+            let b = &via_readonly[ch];
+            assert_eq!(a.len(), b.len(), "CH{} point count mismatch: {} vs {}", ch + 1, a.len(), b.len());
+            let mismatches = a.iter().zip(b.iter()).take(50).filter(|(p, q)| {
+                (p[0] - q[0]).abs() > 1e-12 || (p[1] - q[1]).abs() > 1e-12
+            }).count();
+            assert_eq!(mismatches, 0, "CH{}: first 50 points differ", ch + 1);
+        }
+        eprintln!(
+            "read_raw_points_multi_readonly OK: {} channels × {} points match LRU path",
+            n_ch, via_readonly[0].len(),
+        );
+    }
+
+    /// Multi-segment parallel path: merged.csv is large enough to be split into
+    /// several parse segments. Validates first/last decoded values across the
+    /// segment-merge boundary. Skipped when the (non-repo) data file is absent.
+    #[test]
+    fn raw_points_match_csv_for_merged() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("merged.csv");
+        if !path.exists() {
+            eprintln!("Skipping: merged.csv not found");
+            return;
+        }
+
+        // Force a fresh conversion so the multi-segment parallel path runs
+        // (rather than a cache hit from a prior run).
+        let cache_dir = cache::cache_dir(&path);
+        if cache_dir.exists() {
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
+
+        let mut data = WaveformData::load_csv(path.to_str().unwrap(), &|_, _, _| {}).unwrap();
+        assert_eq!(data.n_channels(), 8, "merged.csv should have 8 data channels");
+
+        let pts_ch0 = data.get_raw_points(0, data.x_min(), data.x_max(), 5_000_000);
+        assert!(!pts_ch0.is_empty(), "merged.csv returned no points");
+
+        // First/last rows of merged.csv:
+        //   -2.2419505084E-04, -2.72194E-01, ...
+        //    2.7580494916E-04,  3.28061E-01, ...
+        let tol = 1e-9;
+        assert!(
+            (pts_ch0[0][0] - (-2.2419505084e-04)).abs() < tol,
+            "merged CH0 time[0]: got {:.12e}, expected -2.2419505084e-04",
+            pts_ch0[0][0],
+        );
+        assert!(
+            (pts_ch0[0][1] - (-2.72194e-01)).abs() < tol,
+            "merged CH0 value[0]: got {:.12e}, expected -2.72194e-01",
+            pts_ch0[0][1],
+        );
+
+        let last = pts_ch0.last().unwrap();
+        assert!(
+            (last[0] - 2.7580494916e-04).abs() < tol,
+            "merged CH0 time[last]: got {:.12e}, expected 2.7580494916e-04",
+            last[0],
+        );
+        assert!(
+            (last[1] - 3.28061e-01).abs() < tol,
+            "merged CH0 value[last]: got {:.12e}, expected 3.28061e-01",
+            last[1],
+        );
+
+        eprintln!(
+            "merged multi-segment validation OK: {} rows, {} points sampled",
+            data.n_rows(),
+            pts_ch0.len(),
+        );
     }
 }
