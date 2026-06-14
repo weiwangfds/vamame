@@ -198,6 +198,9 @@ pub(crate) struct StripCache {
     pub vis_x_max: f64,
     pub delay: f64,
     pub ch_idx: usize,
+    /// True when points came from per-chunk statistics (coarse preview).
+    /// Background decode replaces this with detailed envelope data.
+    pub is_coarse: bool,
 }
 
 impl StripCache {
@@ -350,7 +353,11 @@ pub struct OscilloscopeApp {
     /// Bounds the in-flight background decode targets. Non-None ⇒ a decode is
     /// running; new requests are dropped until it finishes.
     pub(crate) cache_inflight_bounds: Option<(f64, f64)>,
-}
+
+    // --- Density rendering ---
+    pub(crate) density_mode: bool,
+    pub(crate) density_caches: Vec<crate::density_renderer::DensityCache>,
+ }
 
 /// Result of a background line-cache decode pass.
 pub(crate) struct CacheDecodeResult {
@@ -439,6 +446,9 @@ impl Default for OscilloscopeApp {
             // Background line-cache decode
             cache_rx: None,
             cache_inflight_bounds: None,
+
+            density_mode: false,
+            density_caches: Vec::new(),
         }
     }
 }
@@ -528,6 +538,9 @@ impl OscilloscopeApp {
                     }
 
                     self.cache = vec![None; n_data];
+                    self.density_caches = (0..n_data)
+                        .map(|_| crate::density_renderer::DensityCache::new())
+                        .collect();
                     self.measurement_cache = vec![None; n_data];
                     self.measurement_channel = 0;
                     self.needs_initial_fit = true;
@@ -634,7 +647,9 @@ impl OscilloscopeApp {
             return;
         }
 
-        // Snapshot immutable inputs for the background decode.
+        let decode_max_points =
+            (1_500_000 / stale.len()).clamp(20_000, decode_max_points);
+
         let chunks_dir = data.chunks_dir().to_path_buf();
         let entries: Vec<_> = data.entries().to_vec();
         let delays: Vec<f64> = stale
@@ -716,6 +731,7 @@ impl OscilloscopeApp {
                 vis_x_max: result.vis_x_max,
                 delay,
                 ch_idx,
+                is_coarse: false,
             });
         }
 

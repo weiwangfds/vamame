@@ -264,6 +264,7 @@ impl OscilloscopeApp {
             vis_x_max,
             delay,
             ch_idx,
+            is_coarse: false,
         });
     }
 }

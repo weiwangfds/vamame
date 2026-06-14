@@ -3,8 +3,8 @@
 //! Each strip holds one or more channels, rendered as overlaid line plots.
 //! Strips share a linked x-axis for synchronised zoom/pan.
 
-use egui::{Color32, Frame, Id, RichText, Sense, Vec2b};
-use egui_plot::{AxisHints, Corner, CoordinatesFormatter, Legend, Line, Plot, PlotPoints};
+use egui::{Color32, Frame, Id, RichText, Sense, Vec2, Vec2b};
+use egui_plot::{AxisHints, Corner, CoordinatesFormatter, Legend, Line, Plot, PlotImage, PlotPoints, PlotPoint};
 
 use crate::cursor::CursorMode;
 use crate::measurement::Measurements;
@@ -481,6 +481,11 @@ impl OscilloscopeApp {
                             let y_auto_cursor = cursor_mode == CursorMode::Off;
                             let y_offset_before = y_offset_strip;
 
+                            let density_ctx = ui.ctx().clone();
+                            let density_w_px = (ui.available_width().max(1.0) as usize).min(2048);
+                            let density_h_px = (strip_height.max(1.0) as usize).min(1024);
+                            let density_on = self.density_mode;
+
                             let plot_response = plot.show(ui, |plot_ui| {
                                 if initial_fit {
                                     // Auto-fit Y to the data, but keep the X
@@ -518,6 +523,50 @@ impl OscilloscopeApp {
                                     plot_ui.set_auto_bounds(Vec2b::new(false, y_auto_cursor));
                                 }
 
+                                if density_on {
+                                    let b = plot_ui.plot_bounds();
+                                    let (dx_min, dx_max) = (b.min()[0], b.max()[0]);
+                                    let (dy_min, dy_max) = (b.min()[1], b.max()[1]);
+                                    for &ch_idx in &strip_chs {
+                                        if ch_idx >= self.channels.len()
+                                            || !self.channels[ch_idx].visible
+                                            || ch_idx >= self.density_caches.len()
+                                        {
+                                            continue;
+                                        }
+                                        let pts: Option<&[[f64; 2]]> =
+                                            self.cache.get(ch_idx)
+                                                .and_then(|c| c.as_ref())
+                                                .map(|c| c.points.as_slice());
+                                        let Some(pts) = pts else { continue };
+                                        let color = self.channels[ch_idx].color;
+                                        if let Some(dr) = self.density_caches[ch_idx]
+                                            .ensure_texture(
+                                                &density_ctx,
+                                                pts,
+                                                dx_min, dx_max,
+                                                dy_min, dy_max,
+                                                density_w_px, density_h_px,
+                                                color,
+                                            )
+                                        {
+                                            let img = PlotImage::new(
+                                                format!("density-{}", ch_idx),
+                                                dr.texture_id,
+                                                PlotPoint::new(
+                                                    (dr.cached_x_min + dr.cached_x_max) / 2.0,
+                                                    (dy_min + dy_max) / 2.0,
+                                                ),
+                                                Vec2::new(
+                                                    (dr.cached_x_max - dr.cached_x_min) as f32,
+                                                    (dy_max - dy_min) as f32,
+                                                ),
+                                            );
+                                            plot_ui.image(img);
+                                        }
+                                    }
+                                }
+
                                 for &ch_idx in &strip_chs {
                                     if ch_idx >= self.channels.len()
                                         || !self.channels[ch_idx].visible
@@ -532,10 +581,9 @@ impl OscilloscopeApp {
                                         // Line mode: egui_plot::Line (GPU-rasterized)
                                         if let Some(ref cached) = self.cache[ch_idx] {
                                             let line =
-                                                Line::new(PlotPoints::from(cached.points.clone()))
+                                                Line::new(&ch.name, PlotPoints::from(cached.points.clone()))
                                                     .color(ch.color)
-                                                    .width(1.5)
-                                                    .name(&ch.name);
+                                                    .width(1.5);
                                             plot_ui.line(line);
                                         }
                                     }
@@ -547,16 +595,18 @@ impl OscilloscopeApp {
                                         let x_max = bounds.max()[0];
                                         let thresh = ch.threshold_value;
                                         plot_ui.line(
-                                            Line::new(PlotPoints::from(vec![
-                                                [x_min, thresh],
-                                                [x_max, thresh],
-                                            ]))
+                                            Line::new(
+                                                format!("{} Vth={:.3}V", ch.name, thresh),
+                                                PlotPoints::from(vec![
+                                                    [x_min, thresh],
+                                                    [x_max, thresh],
+                                                ]),
+                                            )
                                             .color(
                                                 Color32::from_rgba_unmultiplied(255, 80, 80, 200),
                                             )
                                             .width(1.5)
-                                            .style(egui_plot::LineStyle::Dashed { length: 6.0 })
-                                            .name(&format!("{} Vth={:.3}V", ch.name, thresh)),
+                                            .style(egui_plot::LineStyle::Dashed { length: 6.0 }),
                                         );
                                     }
 
@@ -568,7 +618,10 @@ impl OscilloscopeApp {
                                                 generate_binarized_points(&cached.points, thresh);
                                             if !bin_points.is_empty() {
                                                 plot_ui.line(
-                                                    Line::new(PlotPoints::from(bin_points))
+                                                    Line::new(
+                                                        format!("{} 0/1", ch.name),
+                                                        PlotPoints::from(bin_points),
+                                                    )
                                                         .color(
                                                             Color32::from_rgba_unmultiplied(
                                                                 ch_color_r(ch.color),

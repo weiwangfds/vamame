@@ -87,7 +87,6 @@ impl OscilloscopeApp {
                         {
                             self.cursor.mode = CursorMode::Off;
                             self.cursor.dragging = None;
-                            ui.close_menu();
                         }
                         if ui
                             .selectable_label(
@@ -97,7 +96,6 @@ impl OscilloscopeApp {
                             .clicked()
                         {
                             self.cursor.set_mode(CursorMode::Vertical, x_min, x_max);
-                            ui.close_menu();
                         }
                         if ui
                             .selectable_label(
@@ -107,7 +105,6 @@ impl OscilloscopeApp {
                             .clicked()
                         {
                             self.cursor.set_mode(CursorMode::Horizontal, y_min, y_max);
-                            ui.close_menu();
                         }
                     });
 
@@ -117,11 +114,9 @@ impl OscilloscopeApp {
                     ui.menu_button("Export", |ui| {
                         if ui.button("Export CSV...").clicked() {
                             self.spawn_export_csv_dialog(ctx);
-                            ui.close_menu();
                         }
                         if ui.button("Export PNG...").clicked() {
                             self.spawn_export_png_dialog(ctx);
-                            ui.close_menu();
                         }
                     });
 
@@ -180,6 +175,16 @@ impl OscilloscopeApp {
                     // Math channel
                     if ui.button("Math...").clicked() {
                         self.show_math_dialog = true;
+                    }
+
+                    ui.separator();
+
+                    let density_label = if self.density_mode { "Density: ON" } else { "Density" };
+                    if ui.button(density_label)
+                        .on_hover_text("Toggle density heatmap overlay (best when zoomed out)")
+                        .clicked()
+                    {
+                        self.density_mode = !self.density_mode;
                     }
                 }
 
