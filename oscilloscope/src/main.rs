@@ -2,14 +2,6 @@
 //!
 //! Run: `cargo run -- /path/to/file.csv`
 
-mod app;
-mod cursor;
-mod data;
-mod export;
-mod fft_analysis;
-mod math_channel;
-mod measurement;
-
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -26,10 +18,10 @@ fn main() -> eframe::Result<()> {
         "Oscilloscope",
         options,
         Box::new(move |cc| {
-            let mut app = app::OscilloscopeApp::default();
+            let mut app = oscilloscope::app::OscilloscopeApp::default();
             if let Some(ref path) = csv_path {
                 // Schedule load on first frame via status message
-                app.pending_load_path = Some(path.clone());
+                app.set_pending_load_path(path.clone());
             }
             let _ = cc;
             Ok(Box::new(app))
