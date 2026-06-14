@@ -1,6 +1,6 @@
 [package]
 name = "oscilloscope"
-version = "0.2.0"
+version = "0.5.0"
 default-run = "oscilloscope"
 edition = "2021"
 description = "Oscilloscope waveform viewer — Gorilla codec, zoom-aware downsample"
