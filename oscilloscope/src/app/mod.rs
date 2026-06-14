@@ -42,7 +42,10 @@ pub(crate) const CHANNEL_COLORS: [Color32; 8] = [
 ];
 
 /// Maximum display points per channel (per zoom frame).
-pub(crate) const MAX_DISPLAY_POINTS: usize = 4000;
+/// Max points per channel fed to egui_plot::Line. GPU rasterizes these
+/// effortlessly; this is bounded to keep memory and tessellation in check.
+/// 200k gives good waveform detail even at full range on large files.
+pub(crate) const MAX_DISPLAY_POINTS: usize = 200_000;
 
 /// Minimum strip plot height in pixels.
 pub(crate) const MIN_STRIP_HEIGHT: f32 = 60.0;
@@ -199,10 +202,19 @@ pub(crate) struct StripCache {
 
 impl StripCache {
     pub fn is_valid(&self, vis_x_min: f64, vis_x_max: f64, delay: f64, ch_idx: usize) -> bool {
-        self.ch_idx == ch_idx
-            && self.delay == delay
-            && (self.vis_x_min - vis_x_min).abs() < f64::EPSILON
-            && (self.vis_x_max - vis_x_max).abs() < f64::EPSILON
+        if self.ch_idx != ch_idx || self.delay != delay {
+            return false;
+        }
+        // Visible range must be within the over-fetched cached range so
+        // panning within the buffer doesn't trigger a new decode.
+        if !(self.vis_x_min <= vis_x_min && self.vis_x_max >= vis_x_max) {
+            return false;
+        }
+        // Reject if cached resolution is too low (significant zoom-in since
+        // the cache was populated).
+        let cached_span = self.vis_x_max - self.vis_x_min;
+        let vis_span = (vis_x_max - vis_x_min).max(1e-30);
+        cached_span / vis_span <= 4.0
     }
 }
 
@@ -227,6 +239,9 @@ pub struct OscilloscopeApp {
 
     /// True until the first render after loading data.
     pub(crate) needs_initial_fit: bool,
+    /// Whether the initial Y auto-fit has run after the first background
+    /// decode completed. Reset on each new file load.
+    pub(crate) y_auto_fitted: bool,
 
     /// True when undo-zoom or goto-time needs manual bounds restoration.
     pub(crate) needs_undo_zoom: bool,
@@ -244,6 +259,7 @@ pub struct OscilloscopeApp {
     pub(crate) zoom_history: Vec<PlotBounds>,
     /// User input for "Go to time".
     pub(crate) goto_time_input: String,
+    pub(crate) goto_time_unit: TimeUnit,
 
     // --- Measurement ---
     /// Which channel to show in the measurement panel.
@@ -327,6 +343,22 @@ pub struct OscilloscopeApp {
 
     /// Path to load on the first frame (set via command-line argument).
     pub(crate) pending_load_path: Option<String>,
+
+    // --- Background line-cache decode ---
+    /// Receiver for background-decoded line points.
+    pub(crate) cache_rx: Option<std::sync::mpsc::Receiver<CacheDecodeResult>>,
+    /// Bounds the in-flight background decode targets. Non-None ⇒ a decode is
+    /// running; new requests are dropped until it finishes.
+    pub(crate) cache_inflight_bounds: Option<(f64, f64)>,
+}
+
+/// Result of a background line-cache decode pass.
+pub(crate) struct CacheDecodeResult {
+    pub channels: Vec<usize>,
+    pub points: Vec<Vec<[f64; 2]>>,
+    pub vis_x_min: f64,
+    pub vis_x_max: f64,
+    pub delays: Vec<f64>,
 }
 
 impl Default for OscilloscopeApp {
@@ -340,6 +372,7 @@ impl Default for OscilloscopeApp {
             cache: Vec::new(),
             last_bounds: PlotBounds::NOTHING,
             needs_initial_fit: false,
+            y_auto_fitted: false,
             needs_undo_zoom: false,
             editing_channel: None,
             loaded_path: String::new(),
@@ -347,6 +380,7 @@ impl Default for OscilloscopeApp {
 
             zoom_history: Vec::new(),
             goto_time_input: String::new(),
+            goto_time_unit: TimeUnit::Ps,
 
             measurement_channel: 0,
             measurement_cache: Vec::new(),
@@ -401,6 +435,10 @@ impl Default for OscilloscopeApp {
             loading_progress: None,
             loading_progress_rx: None,
             pending_load_path: None,
+
+            // Background line-cache decode
+            cache_rx: None,
+            cache_inflight_bounds: None,
         }
     }
 }
@@ -408,6 +446,11 @@ impl Default for OscilloscopeApp {
 // ---------- data loading & cache ----------
 
 impl OscilloscopeApp {
+    /// Set a path to load on the first frame (for command-line arguments).
+    pub fn set_pending_load_path(&mut self, path: String) {
+        self.pending_load_path = Some(path);
+    }
+
     /// Start loading a CSV file in a background thread.
     /// The UI will show a progress message until loading completes.
     pub(crate) fn load_csv_from_path(&mut self, path: &str) {
@@ -441,6 +484,11 @@ impl OscilloscopeApp {
         }
 
         if let Ok(result) = self.data_load_rx.try_recv() {
+            // Capture total CSV size before clearing progress (used to cap the
+            // initial view range for very large files).
+            let csv_total_bytes = self.loading_progress.and_then(|(_, _, t)| {
+                if t > 0 { Some(t) } else { None }
+            });
             self.loading_path = None;
             self.loading_progress = None;
             self.loading_progress_rx = None;
@@ -483,17 +531,41 @@ impl OscilloscopeApp {
                     self.measurement_cache = vec![None; n_data];
                     self.measurement_channel = 0;
                     self.needs_initial_fit = true;
+                    self.y_auto_fitted = false;
 
                     let wd = self.data.as_ref().unwrap();
+
+                    // For very large files, showing the full range on first
+                    // paint would force the background decode to read every
+                    // TSZ chunk (thousands for a 30 GB file). Cap the initial
+                    // view instead; the rest loads on demand via pan/zoom.
+                    const INITIAL_VIEW_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
+                    let x_lo = wd.x_min();
+                    let span = wd.time_span();
+                    let ratio = match csv_total_bytes {
+                        Some(total) if total > INITIAL_VIEW_BYTES => {
+                            INITIAL_VIEW_BYTES as f64 / total as f64
+                        }
+                        _ => 1.0,
+                    };
+                    let x_hi = x_lo + span * ratio.max(1e-6);
+
                     self.last_bounds =
-                        PlotBounds::from_min_max([wd.x_min(), -1.0], [wd.x_max(), 1.0]);
+                        PlotBounds::from_min_max([x_lo, -1.0], [x_hi, 1.0]);
 
                     self.cursor = CursorState::default();
 
-                    self.status_message = format!(
-                        "Loaded {} channels × {} rows — scroll to zoom, drag to pan",
-                        n_data, wd.n_rows(),
-                    );
+                    if ratio < 0.999 {
+                        self.status_message = format!(
+                            "Loaded {} ch × {} rows — showing {:.0}% (pan/zoom to load more)",
+                            n_data, wd.n_rows(), ratio * 100.0,
+                        );
+                    } else {
+                        self.status_message = format!(
+                            "Loaded {} channels × {} rows — scroll to zoom, drag to pan",
+                            n_data, wd.n_rows(),
+                        );
+                    }
                 }
                 Err(e) => {
                     self.status_message = format!("Error: {}", e);
@@ -502,46 +574,158 @@ impl OscilloscopeApp {
         }
     }
 
-    /// Ensure the downsample cache for one channel is up-to-date.
+    /// Synchronous cache refresh — used only for **math channels** (derived
+    /// from other channels' cached points). Real channels go through the
+    /// background `ensure_cache_async` path.
     pub(crate) fn ensure_cache(&mut self, ch_idx: usize) {
         let Some(ref data) = self.data else { return };
-        let n_real = data.n_channels();
-
-        // Delegate math channels
-        if ch_idx >= n_real {
-            self.ensure_math_cache(ch_idx);
-            return;
+        if ch_idx < data.n_channels() {
+            return; // real channel: handled by ensure_cache_async
         }
+        self.ensure_math_cache(ch_idx);
+    }
 
-        if ch_idx >= self.channels.len() || ch_idx >= self.cache.len() {
+    /// Ensure line-mode downsample caches for the given channels.
+    ///
+    /// Decoding runs on a **background thread** (stateless, no LRU contention
+    /// with the UI thread's `ChunkStore`), so the UI never blocks on TSZ
+    /// decode. While a decode is in flight the affected channels keep their
+    /// previous (or empty) cache; the result is consumed in
+    /// `finish_cache_async` on a later frame.
+    pub(crate) fn ensure_cache_async(&mut self, ctx: &egui::Context, channels: &[usize]) {
+        let Some(ref data) = self.data else { return };
+
+        // While ANY decode is in flight, never spawn another.
+        if self.cache_inflight_bounds.is_some() {
             return;
         }
 
         let vis_x_min = self.last_bounds.min()[0];
         let vis_x_max = self.last_bounds.max()[0];
-        let delay = self.channels[ch_idx].delay;
 
-        if let Some(ref c) = self.cache[ch_idx] {
-            if c.is_valid(vis_x_min, vis_x_max, delay, ch_idx) {
-                return;
-            }
+        // Over-fetch: decode 2× the visible range (50% margin each side) so
+        // small pans stay within the cached range without a new decode.
+        let vis_span = vis_x_max - vis_x_min;
+        let margin = vis_span * 0.5;
+        let decode_x_min = vis_x_min - margin;
+        let decode_x_max = vis_x_max + margin;
+        // Scale max_points proportionally to keep the same point density.
+        let decode_max_points = MAX_DISPLAY_POINTS * 2;
+
+        // Collect real channels whose cache is stale (math channels handled
+        // separately by ensure_cache, which stays synchronous).
+        let n_real = data.n_channels();
+        let stale: Vec<usize> = channels
+            .iter()
+            .copied()
+            .filter(|&ch_idx| {
+                if ch_idx >= n_real || ch_idx >= self.channels.len() || ch_idx >= self.cache.len() {
+                    return false;
+                }
+                let delay = self.channels[ch_idx].delay;
+                match self.cache.get(ch_idx).and_then(|c| c.as_ref()) {
+                    Some(cached) => !cached.is_valid(vis_x_min, vis_x_max, delay, ch_idx),
+                    None => true,
+                }
+            })
+            .collect();
+
+        if stale.is_empty() {
+            return;
         }
 
-        let points = data.get_channel_points(
-            ch_idx,
-            delay,
-            vis_x_min,
-            vis_x_max,
-            MAX_DISPLAY_POINTS,
-        );
+        // Snapshot immutable inputs for the background decode.
+        let chunks_dir = data.chunks_dir().to_path_buf();
+        let entries: Vec<_> = data.entries().to_vec();
+        let delays: Vec<f64> = stale
+            .iter()
+            .map(|&ch| self.channels[ch].delay)
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.cache_rx = Some(rx);
+        self.cache_inflight_bounds = Some((decode_x_min, decode_x_max));
 
-        self.cache[ch_idx] = Some(StripCache {
-            points,
-            vis_x_min,
-            vis_x_max,
-            delay,
-            ch_idx,
+        let req_chs = stale.clone();
+        let req_vis_min = decode_x_min;
+        let req_vis_max = decode_x_max;
+
+        std::thread::spawn(move || {
+            let raw = crate::data::chunk_store::read_raw_points_multi_readonly(
+                &chunks_dir,
+                &entries,
+                &req_chs,
+                req_vis_min,
+                req_vis_max,
+                decode_max_points,
+            );
+            // Apply per-channel delay to the x coordinate (display convention).
+            let points: Vec<Vec<[f64; 2]>> = raw
+                .into_iter()
+                .zip(delays.iter())
+                .map(|(mut pts, &delay)| {
+                    if delay != 0.0 {
+                        for p in pts.iter_mut() {
+                            p[0] += delay;
+                        }
+                    }
+                    pts
+                })
+                .collect();
+            let _ = tx.send(CacheDecodeResult {
+                channels: req_chs,
+                points,
+                vis_x_min: req_vis_min,
+                vis_x_max: req_vis_max,
+                delays,
+            });
         });
+
+        ctx.request_repaint();
+    }
+
+    /// Consume any finished background line-cache decode.
+    /// Called once per frame (non-blocking).
+    pub(crate) fn finish_cache_async(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.cache_rx.take() else { return };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.cache_rx = Some(rx);
+                ctx.request_repaint();
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.cache_inflight_bounds = None;
+                return;
+            }
+        };
+        self.cache_inflight_bounds = None;
+
+        for ((&ch_idx, pts), &delay) in result
+            .channels
+            .iter()
+            .zip(result.points.into_iter())
+            .zip(result.delays.iter())
+        {
+            if ch_idx >= self.cache.len() {
+                continue;
+            }
+            self.cache[ch_idx] = Some(StripCache {
+                points: pts,
+                vis_x_min: result.vis_x_min,
+                vis_x_max: result.vis_x_max,
+                delay,
+                ch_idx,
+            });
+        }
+
+        // The first background decode lands after the initial frame already
+        // consumed `needs_initial_fit` (with an empty cache). Re-arm it once
+        // so Y auto-fits to the now-available data.
+        if !self.y_auto_fitted {
+            self.needs_initial_fit = true;
+            self.y_auto_fitted = true;
+        }
     }
 
     /// Ensure measurement cache is valid for the selected channel.
@@ -558,18 +742,41 @@ impl OscilloscopeApp {
         let vis_x_min = meas_range.0;
         let vis_x_max = meas_range.1;
 
+        let span = (vis_x_max - vis_x_min).max(1e-30);
+        let tol = span * 1e-6;
         let needs_compute = match &self.measurement_cache[ch_idx] {
             Some((bounds, _)) => {
-                (bounds.min()[0] - vis_x_min).abs() > f64::EPSILON
-                    || (bounds.max()[0] - vis_x_max).abs() > f64::EPSILON
+                (bounds.min()[0] - vis_x_min).abs() > tol
+                    || (bounds.max()[0] - vis_x_max).abs() > tol
             }
             None => true,
         };
 
         if needs_compute {
-            let data = self.data.as_ref().unwrap();
-            let m = Measurements::compute(data, ch_idx, vis_x_min, vis_x_max);
-            // Store with the actual measurement range as cache key
+            let data = self.data.as_mut().unwrap();
+
+            // Prefer reusing the line-cache points (already decoded by the
+            // background thread) for time-domain measurements — no extra TSZ
+            // decode. Only valid when the cache covers the same range.
+            let cache_matches = self
+                .cache
+                .get(ch_idx)
+                .and_then(|c| c.as_ref())
+                .map(|c| {
+                    (c.vis_x_min - vis_x_min).abs() < tol
+                        && (c.vis_x_max - vis_x_max).abs() < tol
+                })
+                .unwrap_or(false);
+
+            let m = if cache_matches {
+                let pts = self.cache[ch_idx].as_ref().unwrap().points.clone();
+                Measurements::compute_from_cached(data, ch_idx, vis_x_min, vis_x_max, &pts)
+            } else {
+                // Cache not ready / range differs (e.g. cursor gate): fall
+                // back to precomputed stats only — cheap, no decode.
+                Measurements::compute_stats_only(data, ch_idx, vis_x_min, vis_x_max)
+            };
+
             self.measurement_cache[ch_idx] = Some((
                 egui_plot::PlotBounds::from_min_max([vis_x_min, 0.0], [vis_x_max, 0.0]),
                 m,
@@ -624,7 +831,8 @@ impl OscilloscopeApp {
         if input.is_empty() {
             return;
         }
-        if let Ok(target_t) = input.parse::<f64>() {
+        if let Ok(value) = input.parse::<f64>() {
+            let target_t = self.goto_time_unit.to_seconds(value);
             let x_span = self.last_bounds.max()[0] - self.last_bounds.min()[0];
             let half = x_span / 2.0;
             self.push_zoom_history();
@@ -633,8 +841,11 @@ impl OscilloscopeApp {
                 [target_t + half, self.last_bounds.max()[1]],
             );
             self.needs_undo_zoom = true;
-            self.status_message =
-                format!("Jumped to t = {}", Measurements::format_value(target_t, "s"));
+            self.status_message = format!(
+                "Jumped to t = {:.6} {}",
+                value,
+                self.goto_time_unit.suffix(),
+            );
         } else {
             self.status_message = "Invalid time value".to_owned();
         }
@@ -652,6 +863,9 @@ impl eframe::App for OscilloscopeApp {
 
         // Check if background data loading finished
         self.check_data_loaded();
+
+        // Consume any finished background line-cache decode (non-blocking).
+        self.finish_cache_async(ctx);
 
         self.check_screenshot_events(ctx);
         self.draw_toolbar(ctx);
@@ -701,6 +915,35 @@ impl eframe::App for OscilloscopeApp {
                                 .color(egui::Color32::GRAY),
                         );
                     }
+                });
+            });
+            ctx.request_repaint();
+            return;
+        }
+
+        if self.data.is_some() {
+            let line_chs: Vec<usize> = (0..self.strips.len())
+                .flat_map(|s_idx| self.strips[s_idx].channel_indices.iter().copied())
+                .collect();
+            if !line_chs.is_empty() {
+                self.ensure_cache_async(ctx, &line_chs);
+            }
+        }
+
+        // First-decode overlay: show spinner while initial decode runs so the
+        // user doesn't see empty plots during the brief decode window.
+        if self.data.is_some()
+            && self.cache_inflight_bounds.is_some()
+            && self.cache.iter().all(|c| c.is_none())
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() / 3.0);
+                    ui.spinner();
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Decoding waveform data…").size(18.0),
+                    );
                 });
             });
             ctx.request_repaint();

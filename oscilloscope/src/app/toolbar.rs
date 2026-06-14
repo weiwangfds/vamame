@@ -46,10 +46,23 @@ impl OscilloscopeApp {
                     let goto_response = ui.add(
                         egui::TextEdit::singleline(&mut self.goto_time_input)
                             .desired_width(80.0)
-                            .hint_text("e.g. 1e-3"),
+                            .hint_text("e.g. 1000"),
                     );
-                    if goto_response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    egui::ComboBox::from_id_salt("goto_time_unit")
+                        .selected_text(self.goto_time_unit.suffix())
+                        .width(45.0)
+                        .show_ui(ui, |ui| {
+                            for &u in crate::app::TimeUnit::all() {
+                                ui.selectable_value(
+                                    &mut self.goto_time_unit,
+                                    u,
+                                    u.suffix(),
+                                );
+                            }
+                        });
+                    if ui.button("Go").clicked()
+                        || (goto_response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     {
                         self.goto_time();
                     }
