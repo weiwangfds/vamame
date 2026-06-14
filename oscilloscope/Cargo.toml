@@ -6,9 +6,9 @@ edition = "2021"
 description = "Oscilloscope waveform viewer — Gorilla codec, zoom-aware downsample"
 
 [dependencies]
-eframe = "0.31"
-egui = "0.31"
-egui_plot = "0.31"
+eframe = { version = "0.33", features = ["wgpu"] }
+egui = "0.33"
+egui_plot = "0.34"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rustfft = "6"
